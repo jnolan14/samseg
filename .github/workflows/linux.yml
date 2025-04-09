@@ -64,10 +64,10 @@ jobs:
         export CC=/opt/rh/gcc-toolset-10/root/usr/bin/gcc
         export CXX=/opt/rh/gcc-toolset-10/root/usr/bin/g++
 
-        .github/workflows/linux_build.sh /opt/python/cp38-cp38/bin/python
         .github/workflows/linux_build.sh /opt/python/cp39-cp39/bin/python
         .github/workflows/linux_build.sh /opt/python/cp310-cp310/bin/python
         .github/workflows/linux_build.sh /opt/python/cp311-cp311/bin/python
+        .github/workflows/linux_build.sh /opt/python/cp312-cp312/bin/python
         ls dist/*.whl | xargs -n1 auditwheel repair
       env:
         ITK_DIR: ITK-install
