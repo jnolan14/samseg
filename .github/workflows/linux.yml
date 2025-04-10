@@ -37,7 +37,7 @@ jobs:
     - name: Install CMake and Zlib
       run: |
         yum install -y cmake3
-        ln -sf /usr/bin/cmake3 /usr/bin/cmake
+
 
     - name: Build ITK
       run: |
