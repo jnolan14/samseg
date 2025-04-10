@@ -33,10 +33,11 @@ jobs:
        source /opt/rh/gcc-toolset-10/enable
        gcc --version
        g++ --version
-    # - name: Install CMake and Zlib
-    #   run: |
-    #     yum install -y cmake3 zlib-devel
-    #     ln -s /usr/bin/cmake3 /usr/bin/cmake
+
+    - name: Install CMake and Zlib
+      run: |
+        yum install -y cmake3
+        ln -s /usr/bin/cmake3 /usr/bin/cmake
 
     - name: Build ITK
       run: |

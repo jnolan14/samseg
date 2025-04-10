@@ -44,7 +44,7 @@ jobs:
 
     - name: Build zlib
       run: |
-         git clone https://github.com/madler/zlib.git
+         git clone --branch v1.3.1 --single-branch https://github.com/madler/zlib.git
          md zlib-build
          cd zlib-build
          cmake ..\zlib -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="..\zlib-install"
