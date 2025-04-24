@@ -4,6 +4,7 @@ import tempfile
 import numpy as np
 import surfa as sf
 import scipy.ndimage
+import samseg
 from samseg import gems
 from samseg.subregions import utils
 
@@ -323,7 +324,7 @@ class MeshModel:
 
         # Just get the image buffer (array) and convert to a Kvl image object
         imageBuffer = self.workingImage.data.copy(order='K')
-        image = gems.KvlImage(gems.utilities.requireNumpyArray(imageBuffer))
+        image = gems.KvlImage(samseg.utilities.requireNumpyArray(imageBuffer))
 
         # Use a multi-resolution approach
         for multiResolutionLevel, meshSmoothingSigma in enumerate(self.cheatingMeshSmoothingSigmas):
@@ -469,7 +470,7 @@ class MeshModel:
 
         # Just get the original image buffer (array) and convert to a Kvl image object
         imageBuffer = self.workingImage.data.copy(order='K')
-        image = gems.KvlImage(gems.utilities.requireNumpyArray(imageBuffer))
+        image = gems.KvlImage(samseg.utilities.requireNumpyArray(imageBuffer))
 
         # Useful to have cached
         numMaskIndices = self.maskIndices[0].shape[-1]
@@ -514,7 +515,7 @@ class MeshModel:
 
             # ATH this is in case the above smoothing only sets the buffer, but this should be removed
             # really since it's not necessary if things are correctly implemented
-            image = gems.KvlImage(gems.utilities.requireNumpyArray(imageBuffer))
+            image = gems.KvlImage(samseg.utilities.requireNumpyArray(imageBuffer))
             
             # Now with this smoothed atlas, we're ready for the real work. There are essentially two sets of parameters
             # to estimate in our generative model: (1) the mesh node locations (parameters of the prior), and (2) the

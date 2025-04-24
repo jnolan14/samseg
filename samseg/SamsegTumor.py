@@ -21,6 +21,8 @@ from skimage.transform import resize
 
 from samseg import gems
 from .Samseg import Samseg
+from .GMM import GMM
+from .ProbabilisticAtlas import ProbabilisticAtlas
 from .utilities import Specification
 from .SamsegUtility import *
 from .merge_alphas import kvlMergeAlphas, kvlGetMergingFractionsTable
@@ -594,7 +596,7 @@ class SamsegTumor(Samseg):
             deformedPath = os.path.join(self.savePath,"templateSpaceResults")
             os.makedirs(deformedPath,exist_ok=True)
             referenceMeshFileName = join(self.atlasDir,"atlas_level2.txt.gz")
-            atlas = gems.ProbabilisticAtlas()
+            atlas = ProbabilisticAtlas()
             referenceMesh = atlas.getMesh(referenceMeshFileName)
             posteriorsTmp = np.zeros(list(self.imageBuffers.shape[:3])+[posteriors.shape[-1]],dtype=np.float32)
             posteriorsTmp[self.mask] = posteriors
@@ -742,8 +744,8 @@ class SamsegTumor(Samseg):
         isTumorMask[~self.mask] = False
         isTumor = isTumorMask[self.mask]
         changeCostEMPerVoxelThreshold = self.optimizationOptions["absoluteCostPerVoxelDecreaseStopCriterion"]
-        tumorGmm = gems.GMM([3], numberOfContrasts=self.imageBuffers.shape[-1],
-                              useDiagonalCovarianceMatrices=self.modelSpecifications.useDiagonalCovarianceMatrices)
+        tumorGmm = GMM([3], numberOfContrasts=self.imageBuffers.shape[-1],
+                       useDiagonalCovarianceMatrices=self.modelSpecifications.useDiagonalCovarianceMatrices)
         tumorGmm.fullHyperMeansNumberOfMeasurements = np.zeros((3))
         tumorGmm.fullHyperVariancesNumberOfMeasurements = np.ones(3) * 3
         tmpPrior = np.ones([isTumor.sum(), 3]) / 3
@@ -787,9 +789,9 @@ class SamsegTumor(Samseg):
         tumorGmm.variances = tumorGmm.variances[bestConfig - 1]
         tumorGmm.mixtureWeights = tumorGmm.mixtureWeights[bestConfig - 1]
         # create a new GMM with 1 class per tumor comp -- In the end, this new gmm, replaces self.gmm
-        gmm = gems.GMM(self.gmm.numberOfGaussiansPerClass[:-1] + list(np.ones(self.nTumorComp + 1).astype(np.int)),
-                         numberOfContrasts=self.imageBuffers.shape[-1],
-                         useDiagonalCovarianceMatrices=self.modelSpecifications.useDiagonalCovarianceMatrices)
+        gmm = GMM(self.gmm.numberOfGaussiansPerClass[:-1] + list(np.ones(self.nTumorComp + 1).astype(np.int)),
+                  numberOfContrasts=self.imageBuffers.shape[-1],
+                  useDiagonalCovarianceMatrices=self.modelSpecifications.useDiagonalCovarianceMatrices)
         gmm.initializeGMMParameters(data, np.ones([data.shape[0], gmm.numberOfGaussians]) / gmm.numberOfGaussians)
         gmm.means[:self.gmm.numberOfGaussians - self.nTumorComp] = self.gmm.means[:-self.nTumorComp]
         gmm.variances[:self.gmm.numberOfGaussians - self.nTumorComp] = self.gmm.variances[:-self.nTumorComp]
@@ -995,7 +997,7 @@ def imagesInAtlasSpace(images,deformation,transform,referenceMesh):
     densePositions = np.array([X,Y,Z]).transpose(1,2,3,0)
     densePositions = densePositions + denseDeformation
     densePositions = densePositions.reshape(-1,densePositions.shape[-1])
-    atlas = gems.ProbabilisticAtlas()
+    atlas = ProbabilisticAtlas()
     densePositionsInSubjectSpace = atlas.mapPositionsFromTemplateToSubjectSpace(densePositions,transform)
     imagesOut = np.zeros(imageSize + [images.shape[-1]])
     for i in range(images.shape[-1]):
