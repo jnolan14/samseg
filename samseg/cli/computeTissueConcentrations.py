@@ -23,6 +23,7 @@ import numpy as np
 import argparse
 import surfa as sf
 from scipy.ndimage import map_coordinates
+import samseg
 from samseg import gems
 
 def main():
@@ -44,16 +45,16 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     if args.show_figs:
-        visualizer = gems.initVisualizer(True, True)
+        visualizer = samseg.initVisualizer(True, True)
     else:
-        visualizer = gems.initVisualizer(False, False)
+        visualizer = samseg.initVisualizer(False, False)
 
     if args.save_figs:
         import nibabel as nib
 
     # We need an init of the probabilistic segmentation class
     # to call instance methods
-    atlas = gems.ProbabilisticAtlas()
+    atlas = samseg.ProbabilisticAtlas()
 
     subjectList = [pathname for pathname in os.listdir(args.subjects_dir) if os.path.isdir(os.path.join(args.subjects_dir, pathname))]
     subjectList.sort()
@@ -115,7 +116,7 @@ def main():
                 history = np.load(historyPath, allow_pickle=True)
                 model_specifications = history['input']['modelSpecifications']
                 transform_matrix = history['transform']
-                transform = gems.KvlTransform(gems.requireNumpyArray(transform_matrix))
+                transform = gems.KvlTransform(samseg.requireNumpyArray(transform_matrix))
                 if not args.longitudinal:
                     deformation = history['historyWithinEachMultiResolutionLevel'][1]['deformation']
                 else:
