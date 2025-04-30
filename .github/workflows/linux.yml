@@ -41,6 +41,7 @@ jobs:
         chmod +x cmake-4.0.1-linux-x86_64.sh
         ./cmake-4.0.1-linux-x86_64.sh --prefix=/usr/local --skip-license
         ln -s /usr/local/bin/cmake /usr/bin/cmake
+        cmake --version
         
     - name: Build ITK
       run: |
