@@ -34,12 +34,12 @@ jobs:
        gcc --version
        g++ --version
 
-    - name: Install CMake 4 and wget
+    - name: Install CMake 3.31.6 and wget
       run: |
         yum install -y wget
-        wget https://github.com/Kitware/CMake/releases/download/v4.0.1/cmake-4.0.1-linux-x86_64.sh
-        chmod +x cmake-4.0.1-linux-x86_64.sh
-        ./cmake-4.0.1-linux-x86_64.sh --prefix=/usr/local --skip-license
+        wget https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.sh
+        chmod +x cmake-3.31.6-linux-x86_64.sh
+        ./cmake-3.31.6-linux-x86_64.sh --prefix=/usr/local --skip-license
         ln -s /usr/local/bin/cmake /usr/bin/cmake
         cmake --version
         
@@ -57,7 +57,6 @@ jobs:
             -DBUILD_TESTING=OFF \
             -DBUILD_EXAMPLES=OFF \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.2 \
             -DCMAKE_INSTALL_PREFIX=../ITK-install \
             ../ITK
         make install
