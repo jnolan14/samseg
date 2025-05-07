@@ -4,7 +4,7 @@ on:
   push:
     branches: [ dev, itk_update ]
     tags:
-      - '*'
+      - '**'
   pull_request:
     branches: [ dev ]
   workflow_dispatch:
