@@ -1,5 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.ndimage import zoom
 from numba import njit, prange
 from numba.typed import List

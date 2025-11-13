@@ -1,6 +1,4 @@
 import numpy as np
-#import nibabel as nib
-#import matplotlib.pyplot as plt
 
 from .GMM_fat_shift import GMM_fat_shift
 
