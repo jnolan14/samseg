@@ -128,6 +128,10 @@ class SamsegLongitudinal:
             for tp in range(self.numberOfTimepoints):
                  self.tpToBaseTransforms.append(np.eye(4))
 
+        self.templateFileName = os.path.join(self.atlasDir, 'template.nii.gz')
+        if (not os.path.isfile(self.templateFileName)):
+            self.templateFileName = os.path.join(self.atlasDir, 'template.nii')
+            
         # Set image-to-image matrix if provided
         self.imageToImageTransformMatrix = imageToImageTransformMatrix
 
@@ -209,12 +213,11 @@ class SamsegLongitudinal:
         if self.imageToImageTransformMatrix is None:
 
             # Affine atlas registration to sst
-            templateFileName = os.path.join(self.atlasDir, 'template.nii.gz')
             affineRegistrationMeshCollectionFileName = os.path.join(self.atlasDir, 'atlasForAffineRegistration.txt.gz')
 
             affine = Affine(imageFileName=self.sstFileNames[0],
                              meshCollectionFileName=affineRegistrationMeshCollectionFileName,
-                             templateFileName=templateFileName)
+                             templateFileName=self.templateFileName)
             self.imageToImageTransformMatrix, _ = affine.registerAtlas(savePath=sstDir, visualizer=self.visualizer, initTransform=initTransform)
 
 
@@ -229,8 +232,7 @@ class SamsegLongitudinal:
         #
         # =======================================================================================
 
-        templateFileName = os.path.join(self.atlasDir, 'template.nii.gz')
-        self.sstModel.imageBuffers, self.sstModel.transform, self.sstModel.voxelSpacing, self.sstModel.cropping = readCroppedImages(self.sstFileNames, templateFileName, self.imageToImageTransformMatrix)
+        self.sstModel.imageBuffers, self.sstModel.transform, self.sstModel.voxelSpacing, self.sstModel.cropping = readCroppedImages(self.sstFileNames, self.templateFileName, self.imageToImageTransformMatrix)
 
         self.imageBuffersList = []
         self.voxelSpacings = []
@@ -241,7 +243,7 @@ class SamsegLongitudinal:
 
             self.imageBuffersList = []
             for imageFileNames in self.imageFileNamesList:
-                imageBuffers, _, _, _ = readCroppedImages(imageFileNames, templateFileName,
+                imageBuffers, _, _, _ = readCroppedImages(imageFileNames, self.templateFileName,
                                                           self.imageToImageTransformMatrix)
                 self.imageBuffersList.append(imageBuffers)
 
@@ -290,7 +292,7 @@ class SamsegLongitudinal:
                 tmpS = sf.load_volume(os.path.join(self.savePath, "base", "template_coregistered.mgz"))
                 pToTpTransform = tmpTp.geom.world2vox @ self.tpToBaseTransforms[timepointNumber].inv() @ tmpS.geom.vox2world @ self.imageToImageTransformMatrix
 
-                imageBuffers, transform, voxelSpacing, cropping = readCroppedImages(imageFileNames, templateFileName, pToTpTransform.matrix)
+                imageBuffers, transform, voxelSpacing, cropping = readCroppedImages(imageFileNames, self.templateFileName, pToTpTransform.matrix)
 
                 #
                 self.imageBuffersList.append(imageBuffers)

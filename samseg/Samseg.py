@@ -67,6 +67,10 @@ class Samseg:
             raise ValueError('number of mode names does not match number of input images')
         self.modeNames = modeNames
 
+        self.templateFileName = os.path.join(self.atlasDir, 'template.nii.gz')
+        if (not os.path.isfile(self.templateFileName)):
+            self.templateFileName = os.path.join(self.atlasDir, 'template.nii')
+        
         # Eugenio: there's a bug in ITK that will cause kvlImage to fail if it contqins the string "recon" ...
         # If this problem is not exclusive to the photo mode (RGB), we should move this chunk of code outside the if
         # While at it, we also create a grayscale version and a version with a bit of noise around the cerebrum (so the
@@ -98,7 +102,7 @@ class Samseg:
         # Initialize some objects
         self.affine = Affine( imageFileName=self.imageFileNames[0],
                               meshCollectionFileName=os.path.join(self.atlasDir, 'atlasForAffineRegistration.txt.gz'),
-                              templateFileName=os.path.join(self.atlasDir, 'template.nii.gz' ) )
+                              templateFileName=self.templateFileName )
         self.probabilisticAtlas = ProbabilisticAtlas()
 
         # Get full model specifications and optimization options (using default unless overridden by user)
@@ -323,7 +327,7 @@ class Samseg:
         else:
             self.imageBuffers, self.transform, self.voxelSpacing, self.cropping = readCroppedImages(
                 self.imageFileNames,
-                os.path.join(self.atlasDir, 'template.nii.gz'),
+                self.templateFileName,
                 self.imageToImageTransformMatrix
             )
 
@@ -597,7 +601,7 @@ class Samseg:
 
         # extract geometries
         source = sf.load_volume(self.imageFileNames[0]).geom
-        target = sf.load_volume(os.path.join(self.atlasDir, 'template.nii.gz')).geom
+        target = sf.load_volume(self.templateFileName).geom
 
         # extract vox-to-vox template transform
         # TODO: Grabbing the transform from the saved .mat file in either the cross or base
