@@ -7,10 +7,13 @@ from samseg.subregions import utils
 from samseg.subregions.thalamus import ThalamicNuclei
 from samseg.subregions.brainstem import BrainstemSubstructures
 from samseg.subregions.hippocampus import HippoAmygdalaSubfields
+# add the ref to the new DTI class
+from samseg.subregions.thalamusDTI import ThalamicNucleiDTI
 
 
 model_lookup = {
     'thalamus' : ThalamicNuclei,
+    'thalamusDTI': ThalamicNucleiDTI,
     'brainstem' : BrainstemSubstructures,
     'hippo-amygdala' : HippoAmygdalaSubfields,
 }
