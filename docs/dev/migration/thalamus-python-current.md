@@ -1,33 +1,122 @@
-# Python Thalamus Status in This Repo
+# Thalamus Current Python Implementation (`segment_subregions` / `ThalamicNuclei`)
 
-## Structural (`thalamus`)
-- Entrypoint wiring: `segment_subregions thalamus` via `model_lookup`.
-- Preserves core structural behavior from base MATLAB.
-- ASEG-driven atlas alignment target.
-- Cheating fit then image fit.
-- Reticular suppression + largest-CC filtering.
-- Whole-thalamus volume totals and standard output files.
+## Scope
+This document captures the current Python implementation in this repo:
+
+- `samseg/cli/segment_subregions.py`
+- `samseg/subregions/process.py`
+- `samseg/subregions/thalamus.py`
+- `samseg/subregions/thalamusDTI.py` (prototype work in `dti_integration`)
+- supporting base class behavior in `samseg/subregions/core.py`
+
+## Entrypoints and interfaces
+
+### CLI interface
+`segment_subregions` exposes thalamus segmentation through:
+
+- `segment_subregions thalamus --cross <subject>`
+- `segment_subregions thalamus --long-base <base>`
+
+Evidence:
+- `samseg/cli/segment_subregions.py:17`
+- `samseg/cli/segment_subregions.py:21`
+
+### Structure wiring
+Model classes are wired through `model_lookup`:
+- `thalamus -> ThalamicNuclei`
+- `thalamusDTI -> ThalamicNucleiDTI` (prototype branch work)
+
+Evidence:
+- `samseg/subregions/process.py:15`
+- `samseg/subregions/process.py:16`
+
+## Input and modality behavior
+
+### Current CLI defaults
+- Input segmentation: `aseg.mgz`
+- Input image list hard-coded to `['norm.mgz']`
 
 Evidence:
 - `samseg/cli/segment_subregions.py:65`
-- `samseg/subregions/process.py:14`
-- `samseg/subregions/thalamus.py:43`
-- `samseg/subregions/thalamus.py:140`
-- `samseg/subregions/thalamus.py:165`
+- `samseg/cli/segment_subregions.py:66`
 
-## DTI Prototype (`thalamusDTI`)
-- New class exists and is registered in `model_lookup`.
-- Adds parameters for `inputDTIDirName` and `dtiLikelihood`.
-- Includes DTI directory parsing and FA loading.
-- Contains substantial TODO/HACK/debug scaffolding and breakpoints.
+### Multi-image support status (structural path)
+- `ThalamicNuclei.preprocess_images()` loops over `self.inputImages` and stacks them, so the model path can accept multiple loaded images.
+- However, CLI only passes one image today.
+- Hyperparameter estimation is still single-image-only (`DATA = self.inputImages[0]`) with explicit TODO.
+- Second-component hyperparameter logic has a TODO for non-T1 contrasts and currently hard-codes the T1-like branch.
+- Base `prepare_for_image_fitting()` still has "multi-image cases down the road" TODO comment and squeezes working image data.
 
 Evidence:
-- `samseg/subregions/process.py:16`
-- `samseg/subregions/thalamusDTI.py:22`
-- `samseg/subregions/thalamusDTI.py:106`
-- `samseg/subregions/thalamusDTI.py:217`
+- image stacking loop: `samseg/subregions/thalamus.py:114`
+- single-image TODO: `samseg/subregions/thalamus.py:255`
+- hard-coded second-component branch TODO: `samseg/subregions/thalamus.py:335`
+- base-class multi-image TODO: `samseg/subregions/core.py:415`
 
-## Integration Gaps (Current Branch)
+## Pipeline summary
+
+Cross-sectional path (`run_cross_sectional`):
+1. Initialize model and preprocess.
+2. Align atlas to segmentation mask.
+3. Fit mesh to segmentation (cheating stage).
+4. Fit mesh to image.
+5. Extract and postprocess segmentation and volumes.
+
+Evidence:
+- `samseg/subregions/process.py:35`
+- `samseg/subregions/process.py:46`
+- `samseg/subregions/process.py:60`
+- `samseg/subregions/process.py:68`
+- `samseg/subregions/process.py:75`
+
+Longitudinal path (`run_longitudinal`) exists and includes base-space alignment and global iterations.
+
+Evidence:
+- `samseg/subregions/process.py:82`
+
+## Thalamus-specific behavior (stable structural path)
+
+### Atlas and core settings
+- Atlas path: `${FREESURFER_HOME}/average/ThalamicNuclei/atlas`
+- Two-component modeling enabled.
+- Cheating schedule: `[3.0, 2.0]`
+- Image fit schedule: `meshSmoothingSigmas=[1.5, 1.125, 0.75, 0]`, `maxIterations=[7,5,5,3]`
+
+Evidence:
+- `samseg/subregions/thalamus.py:14`
+- `samseg/subregions/thalamus.py:18`
+- `samseg/subregions/thalamus.py:21`
+- `samseg/subregions/thalamus.py:25`
+
+### Preprocessing and postprocessing
+- Uses ASEG-derived TH/ventral-DC target mask for alignment.
+- Builds synthetic ASEG (`TH` merged with `VentralDC`) for cheating fit.
+- Crops around thalamus and masks image before fitting.
+- Postprocessing removes reticular labels, keeps largest components per side, writes thalamic outputs and volume summaries.
+
+Evidence:
+- TH/DE constants and mask: `samseg/subregions/thalamus.py:43`
+- synthetic merge: `samseg/subregions/thalamus.py:95`
+- crop/mask: `samseg/subregions/thalamus.py:103`
+- reticular and CC filtering: `samseg/subregions/thalamus.py:140`
+- outputs: `samseg/subregions/thalamus.py:152`
+- whole-thalamus totals: `samseg/subregions/thalamus.py:165`
+
+## DTI prototype behavior (`thalamusDTI`, `dti_integration`)
+
+- New class accepts `inputDTIDirName` and `dtiLikelihood`.
+- Includes DTI dir parsing and FA volume loading.
+- Includes preliminary grouping/hyperparameter customization hooks.
+- Contains TODO/HACK/debug scaffolding and breakpoints.
+
+Evidence:
+- constructor parameters: `samseg/subregions/thalamusDTI.py:22`
+- DTI parsing: `samseg/subregions/thalamusDTI.py:106`
+- likelihood option checks: `samseg/subregions/thalamusDTI.py:217`
+- debug breakpoints present: `samseg/subregions/thalamusDTI.py:516`
+
+## Integration blockers (current branch state)
+
 1. CLI does not provide required constructor args for `thalamusDTI`.
 - `samseg/cli/segment_subregions.py:90`
 - `samseg/subregions/thalamusDTI.py:22`
@@ -43,3 +132,20 @@ Evidence:
 - `samseg/subregions/core.py:431`
 - `samseg/subregions/core.py:608`
 - `samseg/subregions/core.py:736`
+
+## Output artifacts
+
+Structural path outputs:
+- `ThalamicNuclei<suffix>.mgz`
+- `ThalamicNuclei<suffix>.FSvoxelSpace.mgz`
+- `ThalamicNuclei<suffix>.volumes.txt`
+
+Evidence:
+- `samseg/subregions/thalamus.py:152`
+- `samseg/subregions/thalamus.py:154`
+- `samseg/subregions/thalamus.py:169`
+
+## Migration-relevant notes
+
+- Current Python preserves core structural thalamus pipeline behavior from base MATLAB.
+- Updated-MATLAB capabilities are partially represented in DTI prototype code, but not yet production-complete.
