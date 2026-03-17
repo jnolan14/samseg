@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 import argparse
-import surfa as sf
 from samseg import icv
 
 description = '''
@@ -20,7 +19,7 @@ def main():
 
     # read in structure names and volumes from samseg stats 
     structures = []
-    with open(args.input) as fid:
+    with open(args.stats) as fid:
         for line in fid.readlines():
             name, vol, _ = line.split(',')
             _, _, name = name.split(' ')
@@ -28,16 +27,18 @@ def main():
 
     # read in structure names that are considered intra-cranial
     includeStructures = None
-    if args.map:
-        with open(args.map) as fid: includeStructures = [line.strip() for line in fid.readlines()]
+    if args.labels:
+        with open(args.labels) as fid: 
+            includeStructures = [line.strip() for line in fid.readlines()]
 
     # compute intra-cranial volume
     sbtiv = icv(structures, includeStructures)
 
     # write out and exit
     print('intracranial volume: %.6f mm^3' % sbtiv)
-    if args.output:
-        with open(args.output, 'w') as fid: fid.write('# Measure Intra-Cranial, %.6f, mm^3\n' % sbtiv)
+    if args.out:
+        with open(args.out, 'w') as fid: 
+            fid.write('# Measure Intra-Cranial, %.6f, mm^3\n' % sbtiv)
 
 
 if __name__ == '__main__':

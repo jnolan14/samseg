@@ -41,7 +41,7 @@ def parseArguments(argv):
 
 def main():
 
-    parser = parseArguments(sys.argv[1:])
+    args = parseArguments(sys.argv[1:])
 
     # Make sure freesurfer has been sourced
     if not os.environ.get('FREESURFER_HOME'):

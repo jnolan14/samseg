@@ -1,12 +1,6 @@
 # SAMSEG
 
-This repository is under construction. Please look at the [main repository](https://github.com/freesurfer/freesurfer) in the meantime.
-
-TODO: Add segmentation image(s)?
-
 Sequence Adaptive Multimodal SEGmentation (SAMSEG) is a tool to robustly segment dozens of brain structures from head MRI scans without preprocessing. The characteristic property of SAMSEG is that it accepts multi-contrast MRI data without prior assumptions on the specific type of scanner or pulse sequences used. Dedicated versions to handle longitudinal data, or to segment white matter lesions in multiple sclerosis (MS) patients are also available.
-
-TODO: The description above does not include the subregions module. Fix this.
 
 ## Build Status
 
@@ -16,7 +10,7 @@ TODO: The description above does not include the subregions module. Fix this.
 
 ## Getting Started
 
-SAMSEG runs on 64bit Windows, Linux, and MacOS machines. Please visit the official [SAMSEG Wiki](https://surfer.nmr.mgh.harvard.edu/fswiki/Samseg) and [subregions Wiki](https://surfer.nmr.mgh.harvard.edu/fswiki/SubregionSegmentation) for instructions.
+SAMSEG runs on 64-bit Windows, Linux, and MacOS machines. For instructions, please visit the official [SAMSEG Wiki](https://surfer.nmr.mgh.harvard.edu/fswiki/Samseg) and [subregions Wiki](https://surfer.nmr.mgh.harvard.edu/fswiki/SubregionSegmentation).
 
 Most of the functionalities of SAMSEG do not require [FreeSurfer](https://freesurfer.net/) to be installed on your system, except:
 - longitudinal registration preprocessing;
@@ -30,6 +24,8 @@ Most of the functionalities of SAMSEG do not require [FreeSurfer](https://freesu
 `git submodule init`
 `git submodule update`
 
+Note that when you switch between branches with different submodule versions (such as dev and itk_update), you can call `git checkout <branch> --recurse-submodules` to have the submodules automatically updated.
+
 3. Create a virtual environment using, e.g., conda:
 `conda create -n samseg python=3.9`
 
@@ -37,7 +33,7 @@ Most of the functionalities of SAMSEG do not require [FreeSurfer](https://freesu
 `conda activate samseg`
 
 5. Install correct compilers for ITK v.4.13.2
-`conda install -c conda-forge gxx_linux-64=7.5 gcc_linux-64=7.5 sysroot_linux-64=2.17`
+`conda install -c conda-forge gcc==10.4 gxx==10.4`
 
 6. Create the ITK build directory
 `mkdir ITK-build`

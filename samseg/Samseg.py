@@ -3,12 +3,15 @@ import sys
 import logging
 import pickle
 import scipy.io
+import numpy as np
+import nibabel as nib
 import surfa as sf
 from scipy.ndimage import binary_dilation as dilation
 
 from samseg import gems
 from .utilities import Specification
 from .BiasField import BiasField
+from .Fatshift import Fatshift
 from .ProbabilisticAtlas import ProbabilisticAtlas
 from .GMM import GMM
 from .Affine import Affine
@@ -43,6 +46,7 @@ class Samseg:
         ignoreUnknownPriors=False,
         dissectionPhoto=None,
         nthreads=1,
+        fat_shift=False
         ):
 
         # Store input parameters as class variables
@@ -63,6 +67,10 @@ class Samseg:
             raise ValueError('number of mode names does not match number of input images')
         self.modeNames = modeNames
 
+        self.templateFileName = os.path.join(self.atlasDir, 'template.nii.gz')
+        if (not os.path.isfile(self.templateFileName)):
+            self.templateFileName = os.path.join(self.atlasDir, 'template.nii')
+        
         # Eugenio: there's a bug in ITK that will cause kvlImage to fail if it contqins the string "recon" ...
         # If this problem is not exclusive to the photo mode (RGB), we should move this chunk of code outside the if
         # While at it, we also create a grayscale version and a version with a bit of noise around the cerebrum (so the
@@ -94,7 +102,7 @@ class Samseg:
         # Initialize some objects
         self.affine = Affine( imageFileName=self.imageFileNames[0],
                               meshCollectionFileName=os.path.join(self.atlasDir, 'atlasForAffineRegistration.txt.gz'),
-                              templateFileName=os.path.join(self.atlasDir, 'template.nii.gz' ) )
+                              templateFileName=self.templateFileName )
         self.probabilisticAtlas = ProbabilisticAtlas()
 
         # Get full model specifications and optimization options (using default unless overridden by user)
@@ -155,6 +163,7 @@ class Samseg:
         self.saveMesh = saveMesh
         self.ignoreUnknownPriors = ignoreUnknownPriors
         self.dissectionPhoto = dissectionPhoto
+        self.fat_shift = fat_shift
 
         # Make sure we can write in the target/results directory
         os.makedirs(savePath, exist_ok=True)
@@ -318,7 +327,7 @@ class Samseg:
         else:
             self.imageBuffers, self.transform, self.voxelSpacing, self.cropping = readCroppedImages(
                 self.imageFileNames,
-                os.path.join(self.atlasDir, 'template.nii.gz'),
+                self.templateFileName,
                 self.imageToImageTransformMatrix
             )
 
@@ -373,6 +382,38 @@ class Samseg:
         # Write out segmentation and bias field corrected volumes
         volumesInCubicMm = self.writeResults(biasFields, posteriors)
 
+        # fat shift
+        if (self.fat_shift):
+            # prepare data
+            numberOfGaussiansPerClass = [param.numberOfComponents for param in self.modelSpecifications.sharedGMMParameters]
+            _, classNames = kvlGetMergingFractionsTable(self.modelSpecifications.names,
+                                                    self.modelSpecifications.sharedGMMParameters)
+            ws = self.gmm.mixtureWeights.flatten().tolist()            # self.optimizationHistory[-1]["historyWithinEachIteration"][-1]["mixtureWeights"].flatten().tolist()
+            classPriors = self.downSampledClassPriors                  # self.optimizationHistory[-1]["priorsAtEnd"]
+            gaussianPosteriors = self.downSampledGaussianPosteriors    # self.optimizationHistory[-1]["posteriorsAtEnd"]
+
+            # fit model
+            fat_shift = 3
+            sigma_d = 1
+            fatshiftObj = Fatshift(fat_shift, sigma_d,
+                                   numberOfGaussiansPerClass, classNames, ws,
+                                   classPriors, gaussianPosteriors, np.squeeze(self.imageBuffers), np.squeeze(self.mask))
+            fatshiftObj.fitModel()
+
+            # Save orginal and corrected posteriors and the "corrected scan"
+            aff = np.eye(4)
+
+            im_tmp = nib.Nifti1Image(fatshiftObj.gmm_fat_shift.fixed_posteriors, aff)
+            nib.save(im_tmp, os.path.join(self.savePath, 'posterior_fat_shift_v2.mgz'))
+            im_tmp = nib.Nifti1Image(fatshiftObj.gmm_fat_shift.phi, aff)
+            nib.save(im_tmp, os.path.join(self.savePath, 'phi_fat_shift_v2.mgz'))
+
+            im_tmp = nib.Nifti1Image(fatshiftObj.gmm_fat_shift.imagedata, aff)
+            nib.save(im_tmp, os.path.join(self.savePath, 'mr_scan_orig_fat_shift_v2.mgz'))
+            im_tmp = nib.Nifti1Image(fatshiftObj.gmm_fat_shift.mu_s, aff)
+            nib.save(im_tmp, os.path.join(self.savePath, 'mr_scan_corrected_fat_shift_v2.mgz'))
+            
+        
         # Save the template warp
         if self.saveWarp:
             print('Saving the template warp')
@@ -560,7 +601,7 @@ class Samseg:
 
         # extract geometries
         source = sf.load_volume(self.imageFileNames[0]).geom
-        target = sf.load_volume(os.path.join(self.atlasDir, 'template.nii.gz')).geom
+        target = sf.load_volume(self.templateFileName).geom
 
         # extract vox-to-vox template transform
         # TODO: Grabbing the transform from the saved .mat file in either the cross or base
@@ -965,6 +1006,9 @@ class Samseg:
             self.deformationAtlasFileName = optimizationOptions.multiResolutionSpecification[
                 multiResolutionLevel].atlasFileName
 
+            self.downSampledClassPriors = downSampledClassPriors
+            self.downSampledGaussianPosteriors = downSampledGaussianPosteriors
+            
             # Save history of the estimation
             if self.saveHistory:
                 levelHistory['downSamplingFactors'] = downSamplingFactors
