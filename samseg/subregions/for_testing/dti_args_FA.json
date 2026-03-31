@@ -1,0 +1,16 @@
+{
+    "atlasDir":"/usr/local/freesurfer/dev/average/ThalamicNuclei/atlas_DTI",
+    "outDir":"/autofs/space/anubis_001/users/jackson/samsegDTI/port/tmp/mul_ch",
+    "inputImageFileNames":["/autofs/space/anubis_001/users/jackson/samsegDTI/test_subject/subject_101309/mri/norm.mgz", "/autofs/space/anubis_001/users/jackson/samsegDTI/test_subject/subject_101309/dmri/dtifit.1+2+3K_FA.nii.gz"],
+    "inputSegFileName":"/autofs/space/anubis_001/users/jackson/samsegDTI/test_subject/subject_101309/mri/aseg.mgz",
+    "inputDTIDirName":"/autofs/space/anubis_001/users/jackson/samsegDTI/test_subject/subject_101309/dmri",
+    "dtiLikelihood":"DSWbeta",
+    "meshStiffness":0.05,
+    "optimizerType":"L-BFGS",
+    "bbregisterMode":null,
+    "resolution":0.5,
+    "useTwoComponents":true,
+    "tempDir":"tmp_mul_ch",
+    "fileSuffix":"_thalamus_joint",
+    "debug":true
+}

@@ -1,0 +1,23 @@
+{
+    "BG":{
+        "group_keys": ["Unknown"],
+        "group_vals": [1],
+        "post_em_update": false
+    },
+    "Thal":{
+        "group_keys": ["LateralThal", "MedialThal", "CornerThal"],
+        "group_vals": [1],
+        "post_em_update": false,
+        "second_hyps_hack": "samseg.subregions.bimodal_thal_hack"
+    },
+    "VentralDC":{
+        "group_keys": ["VentralDC"],
+        "group_vals": null,
+        "post_em_update": "samseg.subregions.utils.vdc_hack"
+    },
+    "Geniculate": {
+        "group_keys": ["Pallidum", "Putamen"],
+        "group_vals": null,
+        "post_em_update": null
+    }
+}
