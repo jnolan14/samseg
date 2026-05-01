@@ -461,7 +461,7 @@ class ThalamicNucleiDTI(MeshModel):
         Col 2: number of components
         Col 3: search strings
 
-        TODO: Handle labels in the atlas that aren't in the sameGaussianParameters file
+        TODO: Handle labels in the atlas that aren't in the sameGaussianParameters fileargs['tempDir'] = 'tmp_thal'
         """
 
         # load the shared GMM params file

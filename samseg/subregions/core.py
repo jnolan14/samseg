@@ -324,7 +324,6 @@ class MeshModel:
 
         # Just get the image buffer (array) and convert to a Kvl image object
         imageBuffer = self.workingImage.data.copy(order='K')
-        #image = gems.KvlImage(gems.utilities.requireNumpyArray(imageBuffer))
         image = gems.KvlImage(requireNumpyArray(imageBuffer))
 
         # Use a multi-resolution approach
@@ -416,8 +415,6 @@ class MeshModel:
         # for multi-image cases down the road
         self.workingImage.data = np.asfortranarray(self.workingImage.data.squeeze())
         self.workingImageShape = self.workingImage.data.shape[:3]
-        #self.workingImage.data = np.asfortranarray(self.workingImage.data)
-        #self.workingImageShape = self.workingImage.data.shape[:3]
 
         # Read the atlas mesh from file, and apply the previously determined transform to the location of its nodes
         # ATH does this have to be re-read?
@@ -431,28 +428,19 @@ class MeshModel:
 
         # We're not interested in image areas that fall outside our cuboid ROI where our atlas is defined. Therefore,
         # generate a mask of what's inside the ROI. Also, by convention we're skipping all voxels with zero intensity.
-        """ This was the original implementation
-        mask = (self.mesh.rasterize(self.workingImageShape).sum(-1) / 65535) > 0.99
-        """
         mask = (self.mesh.rasterize(self.workingImageShape).sum(-1) / 65535) > 0.99
         if self.alphaMaskStrel > 0:
             mask = scipy.ndimage.morphology.binary_erosion(mask, utils.spherical_strel(self.alphaMaskStrel), border_value=1)
-        # Jackson added 
-        """
-        if len(self.workingImage.data.shape) == 4:
-            mask = mask[..., np.newaxis] # 128, 128, 128 ,1 <-> 128 ,128, 128, 2
-            mask = np.broadcast_to(mask, self.workingImage.data.shape)
-        """
+
         # mask must be 3D to properly index the priors; test for non-0 voxels along stacked dim
         # and force it to be 3D in the case of multi channel before creating the final mask 
         validVoxels = self.workingImage.data > 0 if self.workingImage.data.ndim == 3 else np.all(self.workingImage.data > 0, axis=-1)
-        mask = np.asfortranarray(mask & validVoxels) #if self.workingImage.data.ndim == 3 else np.asfortranarray(mask[..., None] & (self.workingImage.data > 0))
+        mask = np.asfortranarray(mask & validVoxels)
 
         # Apply the mask to the image we're analyzing by setting the intensity of all voxels not belonging
         # to the brain mask to zero. This will automatically discard those voxels in subsequent C++ routines, as
         # voxels with intensity zero are simply skipped in the computations.
         self.workingMask = self.workingImage.new(mask)
-        #self.workingImage[mask == 0] = 0
         self.workingImage[~mask, ...] = 0
 
         ### DEBUG
@@ -461,10 +449,15 @@ class MeshModel:
 
 
         # Let's do this to make results more similar to the matlab version
-        """ original implementation
-        self.maskIndices = np.unravel_index(np.where(mask.flatten(order='F')), self.workingImageShape, order='F')
-        """
-        self.maskIndices = np.unravel_index(np.where(mask.flatten(order='F')), self.workingImageShape, order='F')
+        #self.maskIndices = np.unravel_index(np.where(mask.flatten(order='F')), self.workingImageShape, order='F')
+        self.maskIndices = np.unravel_index(np.where(mask.flatten(order='F'))[0], self.workingImageShape, order='F')
+
+        #$# debug 
+        print(f"maskIndices type: {type(self.maskIndices)}")
+        print(f"maskIndices length: {len(self.maskIndices)}")
+        for i, m in enumerate(self.maskIndices):
+            print(f"maskIndices[{i}].shape: {m.shape}")
+
         # Write the initial and cropped/masked images for debugging purposes
         if self.debug:
             self.processedImage.save(os.path.join(self.tempDir, 'processedImage.mgz'))
@@ -494,7 +487,6 @@ class MeshModel:
 
         # Just get the original image buffer (array) and convert to a Kvl image object
         imageBuffer = self.workingImage.data.copy(order='K')
-        #image = gems.KvlImage(gems.utilities.requireNumpyArray(imageBuffer))
         image = gems.KvlImage(requireNumpyArray(imageBuffer))
 
         # Useful to have cached
@@ -540,7 +532,6 @@ class MeshModel:
 
             # ATH this is in case the above smoothing only sets the buffer, but this should be removed
             # really since it's not necessary if things are correctly implemented
-            #image = gems.KvlImage(gems.utilities.requireNumpyArray(imageBuffer))
             image = gems.KvlImage(requireNumpyArray(imageBuffer))
             
             # Now with this smoothed atlas, we're ready for the real work. There are essentially two sets of parameters
@@ -573,53 +564,19 @@ class MeshModel:
                 # Avoid spike in memory during the posterior computation
                 priors = np.zeros((numMaskIndices, numberOfClasses), dtype='uint16')
                 for l in range(numberOfClasses):
-                    """ original implementation
-                    priors[:, l] = self.mesh.rasterize(self.workingImageShape, l)[self.maskIndices]
-                    """
-                    # in here test for 4D in the working image, if we have multi ch
-                    #if len(self.workingImage.data.shape) == 4:
                     """
                         Rasterization will always return a 3D data shape
                         Stack of input images will always be 4D for intensity volumes
 
                         Add axis to the rasterization of the mask and then broadcast to be the proper shape in the 4th dim to match the input stack, this should allow us to index it based on the list of true indices 
                     """
-                        #priors = priors[..., np.newaxis]
-                        #p_l = self.mesh.rasterize(self.workingImage.shape, l)
-                        #p_l = p_l[..., np.newaxis]
-                        #p_l = np.broadcast_to(p_l.T, self.workingImage.data.shape)
-                        # will this work? is indexing this way going to index the proper dimension?
-
-                        # this should be ijk x label classes, and the mask is just 
-                        # broadcast along the 4th dim, so we can just index the first set of masked indices? Right?
-                        # but when I look at the maked indices lists, they're not the same?
-                        # WE HAVE DUPLICATED X,Y,Z COORDS
-                    #    priors[:, l] = self.mesh.rasterize(self.workingImageShape, l)[self.maskIndices[:3]]
-                        
-                    #else:
                     priors[:, l] = self.mesh.rasterize(self.workingImageShape, l)[self.maskIndices]
 
-
                 posteriors = priors / 65535
-
-                ##$ Print debuggin some image/vector dims
-                #data_flat = data.reshape(-1, data.shape[-1])[self.maskIndices, :] # trash
-                #data_mat = data[0, :, :] if len(data.shape) >= 3 else data.T
-                print(priors.shape)
-                print(posteriors.shape)
-                print(data.shape)
-                #print(data_mat.shape)
-                print(self.maskIndices)
-                print(len(self.maskIndices[0]))
-                print(len(self.maskIndices[1]))
-                print(len(self.maskIndices[2]))
-
 
                 # Start EM iterations. Initialize the parameters if this is the first time ever you run this
                 if (self.means is None) or (self.variances is None):
 
-                    #self.means = np.zeros((numberOfClasses, self.workingImage.shape[-1]))
-                    #self.variances = np.zeros((numberOfClasses, self.workingImage.shape[-1]))
                     n_channels = 1 if imageBuffer.ndim == 3 else imageBuffer.shape[-1]
                     self.means = np.zeros((numberOfClasses, n_channels))
                     self.variances = np.zeros((numberOfClasses, n_channels))
@@ -628,13 +585,7 @@ class MeshModel:
                     for classNumber in range(numberOfClasses):
                         posterior = posteriors[:, classNumber]
                         if np.sum(posterior) > thresh:
-                            ###$
-                            print(f"DEBUG - classNumber: {classNumber}")
-                            print(f"DEBUG - data.shape: {data.shape}")
-                            print(f"DEBUG - posterior.shape: {posterior.shape}")
-                            print(f"DEBUG - self.meanHyper[classNumber].shape: {self.meanHyper[classNumber].shape}")
-                            ###$
-                            #mu = (self.meanHyper[classNumber] * self.nHyper[classNumber] + data.T @ posterior) / (self.nHyper[classNumber] + np.sum(posterior) + thresh)
+
                             mu = (self.meanHyper[classNumber] * self.nHyper[classNumber] + data.T @ posterior) / (self.nHyper[classNumber] + np.sum(posterior) + thresh)
                             variance = (((data - mu) ** 2).T @ posterior + self.nHyper[classNumber] * (mu - self.meanHyper[classNumber]) ** 2) / (np.sum(posterior) + thresh)
                             self.means[classNumber] = mu
@@ -659,12 +610,9 @@ class MeshModel:
                         mu = self.means[classNumber]
                         variance = self.variances[classNumber]
                         prior = priors[:, classNumber] / 65535
-                        #posteriors[:, classNumber] = (np.exp(-(data - mu) ** 2 / 2 / variance) * prior) / np.sqrt(2 * np.pi * variance)
+
                         log_likelihood = -0.5 * np.sum(((data - mu) ** 2) / variance + np.log(2 * np.pi * variance), axis=1)
 
-                        #minLogLikelihood = minLogLikelihood + 0.5 * np.log(2 * np.pi * variance) - 0.5 * np.log(self.nHyper[classNumber]) + \
-                        #                                      0.5 * (self.nHyper[classNumber] / variance) * (mu - self.meanHyper[classNumber]) ** 2
-                        
                         posteriors[:, classNumber] = np.exp(log_likelihood) * prior
 
                         minLogLikelihood = minLogLikelihood + 0.5 * np.sum(np.log(2 * np.pi * variance)) - 0.5 * np.log(self.nHyper[classNumber]) + 0.5 * np.sum((self.nHyper[classNumber] / variance) * (mu - self.meanHyper[classNumber]) ** 2)
@@ -732,27 +680,14 @@ class MeshModel:
                     n_channels = imageBuffer.shape[-1]
                     image_list = [gems.KvlImage(requireNumpyArray(imageBuffer[..., idx])) for idx in range(n_channels)]
                 
-                ##$ DEBUG STUFF
-                print(imageBuffer.shape)
-                print(self.means.shape)
-                print(self.variances.shape)
-                print(full_variance.shape)
-                print(len(image_list))
-                print(n_channels)
-                print(f"self.workingImage.shape: {self.workingImage.shape}")
-                print("Data type checks:")
-                print(f"  means dtype: {self.means.dtype}")
-                print(f"  variances dtype: {self.variances.dtype}")
-                print(f"  full_variance dtype: {full_variance.dtype}")
-
                 # Note that it uses variances instead of precisions
                 calculator = gems.KvlCostAndGradientCalculator(
                     typeName='AtlasMeshToIntensityImage',
-                    images=image_list, ##$[image],
+                    images=image_list,
                     boundaryCondition='Sliding',
                     transform=self.transform,
-                    means=self.means, #self.means[..., np.newaxis],
-                    variances=full_variance, ##$self.variances[..., np.newaxis, np.newaxis],
+                    means=self.means,
+                    variances=full_variance,
                     mixtureWeights=np.ones(len(self.means), dtype='float32'),
                     numberOfGaussiansPerClass=np.ones(len(self.means), dtype='int32'))
 
@@ -808,16 +743,27 @@ class MeshModel:
         # First, undo the collapsing of several structures into super-structures
         self.mesh.alphas = self.originalAlphas
         numberOfClasses = self.originalAlphas.shape[-1]
-        numMaskIndices = self.maskIndices[0].shape[-1]
+        numMaskIndices = self.maskIndices[0].shape[0]
 
         # Compute normalized posteriors
         imgdata = self.workingImage[self.maskIndices]
+        if self.workingImage.data.ndim == 3:
+            imgdata = imgdata.reshape(-1,1)
+        else:
+            imgdata = imgdata.reshape(-1, self.workingImage.data.shape[-1])
+
         posteriors = np.zeros((numMaskIndices, numberOfClasses), dtype='float32')
+
         for classNumber in range(numberOfClasses):
             prior = self.mesh.rasterize(self.workingImageShape, classNumber)
             mu = self.means[self.reducingLookupTable[classNumber]]
             variance = self.variances[self.reducingLookupTable[classNumber]]
-            posteriors[:, classNumber] = (np.exp(-(imgdata - mu) ** 2 / 2 / variance) * (prior[self.maskIndices[:3]] / 65535)) / np.sqrt(2 * np.pi * variance)
+
+            # changed to handle multiple channels
+            log_likelihood = -0.5 * np.sum(((imgdata - mu) ** 2) / variance + np.log(2 * np.pi * variance), axis=-1)
+            posteriors[:, classNumber] = np.exp(log_likelihood) * (prior[self.maskIndices] / 65535)
+            #posteriors[:, classNumber] = (np.exp(-(imgdata - mu) ** 2 / 2 / variance) * (prior[self.maskIndices[:3]] / 65535)) / np.sqrt(2 * np.pi * variance)
+
         normalizer = np.sum(posteriors, -1) + np.finfo(np.float32).eps
         posteriors /= normalizer[..., np.newaxis]
         posteriors = np.round(posteriors * 65535).astype('uint16')
@@ -844,8 +790,8 @@ class MeshModel:
                 self.mesh.alphas = self.originalAlphas
             else:
                 post = self.mesh.rasterize(self.workingImageShape, i)
-            #??? This should be 3D right? pretty sure becasue it's coming from the 
-            post[self.maskIndices[:3]] = posteriors[:, i]
+            
+            post[self.maskIndices] = posteriors[:, i]
 
             if i == 0:
                 max_post = post
