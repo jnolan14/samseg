@@ -72,6 +72,19 @@ def select_args_profile():
 profile_name, args, multi_args = select_args_profile()
 print(f"Using subregions testing profile: {profile_name}")
 
+### Object roles:
+### - dti: DTI-aware thalamus run with one structural image plus the DTI dir.
+### - thal: standard thalamus run with the structural image only.
+### - multi: DTI-aware thalamus run with structural and FA image channels.
+###
+### With the Henry profile, debug/intermediate files are written under:
+### - dti: tmp_dti
+### - thal: tmp_thal
+### - multi: tmp_mul_ch
+###
+### Final outputs are written under each object's outDir.  For DTI objects,
+### initialize() appends results/EM/<dtiLikelihood><fileSuffix> under outDir.
+
 ### init the DTI class
 dti = DTI.ThalamicNucleiDTI(**args)
 
@@ -90,54 +103,86 @@ multi = DTI.ThalamicNucleiDTI(**multi_args)
 
 ### BEGIN PROCESS.PY CALLS
 ## initialize
+## Writes/creates:
+## - dti/tempDir, thal/tempDir, multi/tempDir
+## - dti/outDir/results/EM/DSWbeta_thalamus_joint
+## - thal/outDir
+## - multi/outDir/results/EM/DSWbeta_thalamus_joint
 dti.initialize()
 thal.initialize()
 multi.initialize()
 
 ## align atlas to input seg
+## Writes in each tempDir:
+## - targetMask.mgz
+## - alignedAtlasImage.mgz
+## - trash.lta
 dti.align_atlas_to_seg()
 thal.align_atlas_to_seg()
 multi.align_atlas_to_seg()
 
 ## prep for seg fitting
+## Writes in each tempDir when debug=True:
+## - synthImage.mgz
+## - synthImageMasked.mgz
 dti.prepare_for_seg_fitting()
 thal.prepare_for_seg_fitting()
 multi.prepare_for_seg_fitting()
 
 ## fit mesh to seg
+## Writes in each tempDir:
+## - warpedOriginalMesh.txt
 dti.fit_mesh_to_seg()
 thal.fit_mesh_to_seg()
 multi.fit_mesh_to_seg()
 
 ## additional k-means clustering step for DTI
 # Not performed on standard thalamus pipeline
+## Writes in dti and multi tempDirs:
+## - initialSegFromPriors.mgz
+## - boxedASEGTHDE.mgz
 dti.synthseg_kmeans()
 multi.synthseg_kmeans()
 
 ## prepare for image fitting
+## Writes in each tempDir when debug=True:
+## - processedImage.mgz
+## - processedImageMasked.mgz
+## - processedImageMask.mgz
 dti.prepare_for_image_fitting()
 thal.prepare_for_image_fitting()
 multi.prepare_for_image_fitting()
 
 ## fit mesh to image
+## Optimizes the in-memory mesh and Gaussian parameters.
+## No direct file writes are expected from this step.
 dti.fit_mesh_to_image()
 thal.fit_mesh_to_image()
 multi.fit_mesh_to_image()
 
 ## extract segmentation
 # This will need some work for the DTI classes
+## Writes in each tempDir when debug=True:
+## - finalWarpedMesh.txt
+## - finalWarpedMeshNoAffine.txt
+## - discreteLabelsAll.mgz
 dti.extract_segmentation()
 thal.extract_segmentation()
 multi.extract_segmentation()
 
 ## postprocess segmentation
 # This will also need a bit of work for the DTI calsses
+## Writes in each object's output tree:
+## - ThalamicNuclei_thalamus_joint.mgz
+## - ThalamicNuclei_thalamus_joint.FSvoxelSpace.mgz
+## - ThalamicNuclei_thalamus_joint.volumes.txt
 dti.postprocess_segmentation()
 thal.postprocess_segmentation()
 multi.postprocess_segmentation()
 
 ## cleanup
 # not really needed for tests, should just remove temp files
+## With debug=True, tempDirs are left in place for inspection.
 dti.cleanup()
 thal.cleanup()
 multi.cleanup()
