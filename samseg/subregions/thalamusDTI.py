@@ -323,7 +323,11 @@ class ThalamicNucleiDTI(MeshModel):
         print("LOADING JSON GROUPINGS")
         self.grouping_dict = json.load(
             open(
-                "/autofs/space/anubis_001/users/jackson/samsegDTI/port/tmp/means_groupings.json",
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "for_testing",
+                    "means_groupings.json",
+                ),
                 "r",
             )
         )

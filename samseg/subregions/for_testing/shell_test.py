@@ -12,35 +12,81 @@ Steps follow the steps for processing a crossectional subregions run. Taken from
 
 ### import required modules
 import json
+from pathlib import Path
 from samseg.subregions import thalamus as thalamus
 from samseg.subregions import thalamusDTI as DTI
 
-### load the json file with the MeshModel args
-f = '/autofs/space/anubis_001/users/jackson/samsegDTI/port/samseg/samseg/subregions/dti_args.json' # update this path
-f = open(f,'r')
-args =json.load(f)
-f.close()
+TESTING_DIR = Path(__file__).resolve().parent
+
+ARG_PROFILES = [
+    {
+        "name": "Henry",
+        "dti": TESTING_DIR / "dti_args_henry.json",
+        "multi": TESTING_DIR / "dti_args_FA_henry.json",
+    },
+    {
+        "name": "Jackson",
+        "dti": TESTING_DIR / "dti_args.json",
+        "multi": TESTING_DIR / "dti_args_FA.json",
+    },
+]
+
+
+def load_args(path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def required_paths(args):
+    paths = {
+        "atlasDir": Path(args["atlasDir"]),
+        "inputSegFileName": Path(args["inputSegFileName"]),
+        "inputDTIDirName": Path(args["inputDTIDirName"]),
+        "inputImageFileNames[0]": Path(args["inputImageFileNames"][0]),
+    }
+    return paths
+
+
+def select_args_profile():
+    missing_by_profile = {}
+    for profile in ARG_PROFILES:
+        dti_args = load_args(profile["dti"])
+        multi_args = load_args(profile["multi"])
+        missing = [
+            f"{args_name}.{path_name}: {path}"
+            for args_name, args in (("dti", dti_args), ("multi", multi_args))
+            for path_name, path in required_paths(args).items()
+            if not path.exists()
+        ]
+        if not missing:
+            return profile["name"], dti_args, multi_args
+        missing_by_profile[profile["name"]] = missing
+
+    lines = ["No valid subregions testing profile found.", "Missing paths:"]
+    for profile_name, missing in missing_by_profile.items():
+        lines.append(f"- {profile_name}")
+        lines.extend(f"  - {path}" for path in missing)
+    raise SystemExit("\n".join(lines))
+
+
+profile_name, args, multi_args = select_args_profile()
+print(f"Using subregions testing profile: {profile_name}")
 
 ### init the DTI class
 dti = DTI.ThalamicNucleiDTI(**args)
 
 ### pop DTI specific args, update temp dir name for standard subregions init
-args.pop('atlasDir')
-args.pop('inputDTIDirName')
-args.pop('dtiLikelihood')
-args['tempDir'] = 'tmp_thal'
+args.pop("atlasDir")
+args.pop("inputDTIDirName")
+args.pop("dtiLikelihood")
+args["tempDir"] = str(Path(args["tempDir"]).parent / "tmp_thal")
+args["outDir"] = str(Path(args["outDir"]).parent / "thal")
 
 ### init standard thalamus subregions class
 thal = thalamus.ThalamicNuclei(**args)
 
-### load the json for the multi channel MeshModel class
-f = '/autofs/space/anubis_001/users/jackson/samsegDTI/port/samseg/samseg/subregions/dti_args_FA.json' # NOTE: this file differs from previous json, also includes path to FA image
-f = open(f,'r')
-args =json.load(f)
-f.close()
-
 ### init the multi channel MeshModel
-multi = DTI.ThalamicNucleiDTI(**args)
+multi = DTI.ThalamicNucleiDTI(**multi_args)
 
 ### BEGIN PROCESS.PY CALLS
 ## initialize

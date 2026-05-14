@@ -1,0 +1,16 @@
+{
+    "atlasDir":"/Applications/freesurfer/8.2.0/average/ThalamicNuclei/atlas_DTI",
+    "outDir":"/Users/henrytregidgo/PycharmProjects/Samseg/samseg/for_testing_outputs/mul_ch",
+    "inputImageFileNames":["/Users/henrytregidgo/Documents/testVolumes/ThalamusTemplate/subject_100206/mri/norm.mgz", "/Users/henrytregidgo/Documents/testVolumes/ThalamusTemplate/subject_100206/dmri/dtifit.1+2+3K_FA.nii.gz"],
+    "inputSegFileName":"/Users/henrytregidgo/Documents/testVolumes/ThalamusTemplate/subject_100206/mri/aseg.mgz",
+    "inputDTIDirName":"/Users/henrytregidgo/Documents/testVolumes/ThalamusTemplate/subject_100206/dmri",
+    "dtiLikelihood":"DSWbeta",
+    "meshStiffness":0.05,
+    "optimizerType":"L-BFGS",
+    "bbregisterMode":null,
+    "resolution":0.5,
+    "useTwoComponents":true,
+    "tempDir":"/Users/henrytregidgo/PycharmProjects/Samseg/samseg/tmp_mul_ch",
+    "fileSuffix":"_thalamus_joint",
+    "debug":true
+}
