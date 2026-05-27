@@ -32,6 +32,7 @@ class ThalamicNucleiDTI(MeshModel):
         bbregisterMode=None,
         resolution=0.5,
         useTwoComponents=True,  # maybe we just hard code this? nothing depends on this in the super.__init__, so we could always hard code post call
+        covariance_mode='diagonal',
         tempDir=None,
         fileSuffix="_thalamus_joint",
         debug=True,
@@ -47,6 +48,7 @@ class ThalamicNucleiDTI(MeshModel):
             bbregisterMode=bbregisterMode,
             resolution=resolution,
             useTwoComponents=useTwoComponents,
+            covariance_mode=covariance_mode,
             tempDir=tempDir,
             fileSuffix=fileSuffix,
             debug=debug,
@@ -323,7 +325,11 @@ class ThalamicNucleiDTI(MeshModel):
         print("LOADING JSON GROUPINGS")
         self.grouping_dict = json.load(
             open(
-                "/autofs/space/anubis_001/users/jackson/samsegDTI/port/tmp/means_groupings.json",
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "for_testing",
+                    "means_groupings.json",
+                ),
                 "r",
             )
         )
@@ -878,7 +884,11 @@ class ThalamicNucleiDTI(MeshModel):
         """
         # should have already called get_label_groups, so sgp should be the sharedGMM version
         nHyper = np.zeros(len(sameGaussianParameters))
-        meanHyper = np.zeros(len(sameGaussianParameters))
+        if hasattr(self, "processedImage") and self.processedImage.data.ndim > 3:
+            n_channels = self.processedImage.data.shape[-1]
+        else:
+            n_channels = len(self.inputImages)
+        meanHyper = np.zeros(len(sameGaussianParameters)) if n_channels == 1 else np.zeros((len(sameGaussianParameters), n_channels))
 
         # TODO this needs to be adapted for multi-image cases (with masking)
         DATA = self.inputImages[0]
@@ -948,7 +958,18 @@ class ThalamicNucleiDTI(MeshModel):
                 )
                 total_mask = MASK & (DATA > 0)
                 data = DATA[total_mask]
-                meanHyper[g] = np.median(data)
+                if n_channels == 1:
+                    meanHyper[g] = np.median(data)
+                else:
+                    channel_means = np.zeros(n_channels)
+                    for channel in range(n_channels):
+                        image = self.inputImages[channel] if channel < len(self.inputImages) else DATA
+                        if image.shape[:3] == DATA.shape[:3]:
+                            channel_mask = MASK & (image > 0)
+                            channel_means[channel] = np.median(image[channel_mask])
+                        else:
+                            channel_means[channel] = np.median(data)
+                    meanHyper[g] = channel_means
                 """WE NEED TO  DECIDE HOW TO STORE THE LAMBDAS"""
                 # PESUDO CODE:
                 # if post_em_update is not None:
@@ -961,7 +982,11 @@ class ThalamicNucleiDTI(MeshModel):
                     M, H = post_em_update(self)
                     # optionally update the meanHyper and nHyper if new values returned
                     if M is not None:
-                        meanHyper[g] = M
+                        if n_channels == 1:
+                            meanHyper[g] = M
+                        else:
+                            M = np.asarray(M)
+                            meanHyper[g] = M if M.shape == (n_channels,) else np.full(n_channels, M)
                     if H is not None:
                         nHyper[g] = H
                     if self.bp:
@@ -977,8 +1002,11 @@ class ThalamicNucleiDTI(MeshModel):
 
         # If any NaN, replace by background
         # ATH: I don't there would ever be NaNs here?
-        nans = np.isnan(meanHyper)
-        meanHyper[nans] = 55
+        nans = np.isnan(meanHyper) if n_channels == 1 else np.any(np.isnan(meanHyper), axis=1)
+        if n_channels == 1:
+            meanHyper[nans] = 55
+        else:
+            meanHyper[nans] = 55
         nHyper[nans] = 10
         print("get_g_hyps end")
         if self.bp:
@@ -1066,17 +1094,29 @@ class ThalamicNucleiDTI(MeshModel):
         if True:
             # Lateral, brighter
             nHyper[-1] = 25
-            meanHyper[-1] = ThInt + 5
+            if np.ndim(meanHyper) == 1:
+                meanHyper[-1] = ThInt + 5
+            else:
+                meanHyper[-1] = ThInt + 5
             # Medial, darker
             nHyper = np.append(nHyper, 25)
-            meanHyper = np.append(meanHyper, ThInt - 5)
+            if np.ndim(meanHyper) == 1:
+                meanHyper = np.append(meanHyper, ThInt - 5)
+            else:
+                meanHyper = np.concatenate([meanHyper, (ThInt - 5)[None, :]], axis=0)
         else:
             nHyper[-1] = 25
             nHyper = np.append(nHyper, 25)
             # Lateral, more WM-ish (e.g., darker, in FGATIR)
-            meanHyper[-1] = ThInt * (0.95 + 0.1 * (meanHyper[WMind] >= meanHyper[GMind]))
+            if np.ndim(meanHyper) == 1:
+                meanHyper[-1] = ThInt * (0.95 + 0.1 * (meanHyper[WMind] >= meanHyper[GMind]))
+            else:
+                meanHyper[-1] = ThInt * (0.95 + 0.1 * (meanHyper[WMind] >= meanHyper[GMind]))
             # Medial, more GM-ish (e.g., brighter, in FGATIR)
-            meanHyper = np.append(meanHyper, ThInt * (0.95 + 0.1 * (meanHyper[WMind] < meanHyper[GMind])))
+            if np.ndim(meanHyper) == 1:
+                meanHyper = np.append(meanHyper, ThInt * (0.95 + 0.1 * (meanHyper[WMind] < meanHyper[GMind])))
+            else:
+                meanHyper = np.concatenate([meanHyper, (ThInt * (0.95 + 0.1 * (meanHyper[WMind] < meanHyper[GMind])))[None, :]], axis=0)
         """
         for g in range(len(sameGaussianParameters)):
             labels = np.array(sameGaussianParameters[g])
@@ -1103,7 +1143,11 @@ class ThalamicNucleiDTI(MeshModel):
                     M, H = post_em_update(self)
                     # optionally update the meanHyper and nHyper if new values returned
                     if M is not None:
-                        meanHyper[g] = M
+                        if np.ndim(meanHyper) == 1:
+                            meanHyper[g] = M
+                        else:
+                            M = np.asarray(M)
+                            meanHyper[g] = M if M.shape == (meanHyper.shape[1],) else np.full(meanHyper.shape[1], M)
                     if H is not None:
                         nHyper[g] = H
 
