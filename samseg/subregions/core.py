@@ -7,6 +7,15 @@ import scipy.ndimage
 from samseg import gems
 from samseg.utilities import requireNumpyArray
 from samseg.subregions import utils
+from samseg.subregions.gaussian import (
+    covariance_for_gems,
+    diagonal_gaussian_log_likelihood,
+    diagonal_posterior_update,
+    full_covariance_posterior_update,
+    full_gaussian_log_likelihood,
+    full_mean_prior_cost,
+    validate_covariance_mode,
+)
 
 
 class MeshModel:
@@ -22,6 +31,7 @@ class MeshModel:
         bbregisterMode=None,
         resolution=0.5,
         useTwoComponents=False,
+        covariance_mode='diagonal',
         tempDir=None,
         fileSuffix='',
         debug=False,
@@ -58,6 +68,7 @@ class MeshModel:
         self.bbregisterMode = bbregisterMode
         self.resolution = resolution
         self.useTwoComponents = useTwoComponents
+        self.covariance_mode = validate_covariance_mode(covariance_mode)
         self.tempDir = tempDir
         self.fileSuffix = fileSuffix
         self.debug = debug
@@ -579,23 +590,45 @@ class MeshModel:
 
                     n_channels = 1 if imageBuffer.ndim == 3 else imageBuffer.shape[-1]
                     self.means = np.zeros((numberOfClasses, n_channels))
-                    self.variances = np.zeros((numberOfClasses, n_channels))
+                    if self.covariance_mode == 'diagonal':
+                        self.variances = np.zeros((numberOfClasses, n_channels))
+                    else:
+                        self.variances = np.zeros((numberOfClasses, n_channels, n_channels))
 
                     thresh = 1e-2
                     for classNumber in range(numberOfClasses):
                         posterior = posteriors[:, classNumber]
                         if np.sum(posterior) > thresh:
-
-                            mu = (self.meanHyper[classNumber] * self.nHyper[classNumber] + data.T @ posterior) / (self.nHyper[classNumber] + np.sum(posterior) + thresh)
-                            variance = (((data - mu) ** 2).T @ posterior + self.nHyper[classNumber] * (mu - self.meanHyper[classNumber]) ** 2) / (np.sum(posterior) + thresh)
-                            self.means[classNumber] = mu
-                            self.variances[classNumber] = variance + thresh
+                            if self.covariance_mode == 'diagonal':
+                                mu, variance = diagonal_posterior_update(
+                                    data,
+                                    posterior,
+                                    self.meanHyper[classNumber],
+                                    self.nHyper[classNumber],
+                                    thresh=thresh,
+                                )
+                                self.means[classNumber] = mu
+                                self.variances[classNumber] = variance
+                            else:
+                                mu, covariance = full_covariance_posterior_update(
+                                    data,
+                                    posterior,
+                                    self.meanHyper[classNumber],
+                                    self.nHyper[classNumber],
+                                    thresh=thresh,
+                                )
+                                self.means[classNumber] = mu
+                                self.variances[classNumber] = covariance
                         else:
                             self.means[classNumber] = self.meanHyper[classNumber]
-                            self.variances[classNumber] = 100
+                            if self.covariance_mode == 'diagonal':
+                                self.variances[classNumber] = 100
+                            else:
+                                self.variances[classNumber] = np.eye(n_channels) * 100
 
                     # Prevents NaNs during the optimization
-                    self.variances[self.variances == 0] = 100
+                    if self.covariance_mode == 'diagonal':
+                        self.variances[self.variances == 0] = 100
 
                 stopCriterionEM = 1e-5
                 historyOfEMCost = []
@@ -611,11 +644,14 @@ class MeshModel:
                         variance = self.variances[classNumber]
                         prior = priors[:, classNumber] / 65535
 
-                        log_likelihood = -0.5 * np.sum(((data - mu) ** 2) / variance + np.log(2 * np.pi * variance), axis=1)
+                        if self.covariance_mode == 'diagonal':
+                            log_likelihood = diagonal_gaussian_log_likelihood(data, mu, variance)
+                            minLogLikelihood = minLogLikelihood + 0.5 * np.sum(np.log(2 * np.pi * variance)) - 0.5 * np.log(self.nHyper[classNumber]) + 0.5 * np.sum((self.nHyper[classNumber] / variance) * (mu - self.meanHyper[classNumber]) ** 2)
+                        else:
+                            log_likelihood = full_gaussian_log_likelihood(data, mu, variance)
+                            minLogLikelihood = minLogLikelihood + full_mean_prior_cost(mu, variance, self.meanHyper[classNumber], self.nHyper[classNumber])
 
                         posteriors[:, classNumber] = np.exp(log_likelihood) * prior
-
-                        minLogLikelihood = minLogLikelihood + 0.5 * np.sum(np.log(2 * np.pi * variance)) - 0.5 * np.log(self.nHyper[classNumber]) + 0.5 * np.sum((self.nHyper[classNumber] / variance) * (mu - self.meanHyper[classNumber]) ** 2)
                         
                     normalizer = np.sum(posteriors, -1) + np.finfo(np.float32).eps
                     posteriors /= normalizer[..., np.newaxis]
@@ -648,16 +684,36 @@ class MeshModel:
                     for classNumber in range(numberOfClasses):
                         posterior = posteriors[:, classNumber]
                         if np.sum(posterior) > thresh:
-                            mu = (self.meanHyper[classNumber] * self.nHyper[classNumber] + data.T @ posterior) / (self.nHyper[classNumber] + np.sum(posterior) + thresh)
-                            variance = (((data - mu) ** 2).T @ posterior + self.nHyper[classNumber] * (mu - self.meanHyper[classNumber]) ** 2) / (np.sum(posterior) + thresh)
-                            self.means[classNumber] = mu
-                            self.variances[classNumber] = variance + thresh
+                            if self.covariance_mode == 'diagonal':
+                                mu, variance = diagonal_posterior_update(
+                                    data,
+                                    posterior,
+                                    self.meanHyper[classNumber],
+                                    self.nHyper[classNumber],
+                                    thresh=thresh,
+                                )
+                                self.means[classNumber] = mu
+                                self.variances[classNumber] = variance
+                            else:
+                                mu, covariance = full_covariance_posterior_update(
+                                    data,
+                                    posterior,
+                                    self.meanHyper[classNumber],
+                                    self.nHyper[classNumber],
+                                    thresh=thresh,
+                                )
+                                self.means[classNumber] = mu
+                                self.variances[classNumber] = covariance
                         else:
                             self.means[classNumber] = self.meanHyper[classNumber]
-                            self.variances[classNumber] = 100
+                            if self.covariance_mode == 'diagonal':
+                                self.variances[classNumber] = 100
+                            else:
+                                self.variances[classNumber] = np.eye(n_channels) * 100
 
                     # Prevents NaNs during the optimization
-                    self.variances[self.variances == 0] = 100
+                    if self.covariance_mode == 'diagonal':
+                        self.variances[self.variances == 0] = 100
 
                 # Part II: update the position of the mesh nodes for the current set of Gaussian parameters
 
@@ -670,7 +726,7 @@ class MeshModel:
                 ##$ reshape the variances
                 full_variance = np.zeros((self.means.shape[0], self.means.shape[1], self.means.shape[1]))
                 for i in range(self.means.shape[0]):
-                    full_variance[i] = np.diag(self.variances[i])
+                    full_variance[i] = covariance_for_gems(self.variances[i], self.covariance_mode)
 
                 ##$ handle building the image list for single and multi channel
                 if imageBuffer.ndim == 3:
@@ -759,8 +815,10 @@ class MeshModel:
             mu = self.means[self.reducingLookupTable[classNumber]]
             variance = self.variances[self.reducingLookupTable[classNumber]]
 
-            # changed to handle multiple channels
-            log_likelihood = -0.5 * np.sum(((imgdata - mu) ** 2) / variance + np.log(2 * np.pi * variance), axis=-1)
+            if self.covariance_mode == 'diagonal':
+                log_likelihood = diagonal_gaussian_log_likelihood(imgdata, mu, variance)
+            else:
+                log_likelihood = full_gaussian_log_likelihood(imgdata, mu, variance)
             posteriors[:, classNumber] = np.exp(log_likelihood) * (prior[self.maskIndices] / 65535)
             #posteriors[:, classNumber] = (np.exp(-(imgdata - mu) ** 2 / 2 / variance) * (prior[self.maskIndices[:3]] / 65535)) / np.sqrt(2 * np.pi * variance)
 
