@@ -4,6 +4,7 @@ import tempfile
 import numpy as np
 import surfa as sf
 import scipy.ndimage
+import samseg
 from samseg import gems
 from samseg.utilities import requireNumpyArray
 from samseg.subregions import utils

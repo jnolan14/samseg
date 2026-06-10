@@ -626,15 +626,90 @@ class Samseg:
         # adjust for the offset introduced by volume cropping
         coordmap[~invalid, :] += [slc.start for slc in self.cropping]
         
-        # writing a GCA morph requires the fsbindings to be built - this is usually only the case
-        # for complete development builds or in distributed freesurfer releases
-        try:
+        # check if fsbindings package is installed, which is required to save a GCA morph
+        import importlib
+        spec = importlib.util.find_spec('fsbindings')
+        if (spec):
+            # writing a GCA morph requires the fsbindings to be built - this is usually only the case
+            # for complete development builds or in distributed freesurfer releases
             import fsbindings
-        except ImportError:
-            raise ImportError('the fsbindings package is required to save a GCA morph, but it is not available')
+            # write the morph
+            fsbindings.write_gca_morph(coordmap, matrix, source, target, filename)
 
-        # write the morph
-        fsbindings.write_gca_morph(coordmap, matrix, source, target, filename)
+        # write warpfield in mgz format
+        self._saveMGZWarpField(coordmap, source, target, matrix)
+
+
+    """
+    # 'template_warp.mgz' is to replace 'template.m3z' created using fsbindings.write_gca_morph().
+    #
+    # For fsbindings.write_gca_morph() implementation, 
+    # see https://github.com/freesurfer/freesurfer/blob/dev/python/fsbindings/bindings_transform.cpp#L185
+    #
+    # The logic is as following:
+    #
+    #   ...
+    #
+    #   # 1. create gcam object with coordmap baseshape
+    #   GCAM *gcam = GCAMalloc(warpdata.shape(0), warpdata.shape(1), warpdata.shape(2));
+    #   ...
+    #
+    #   # 2. initialize GCA_MORPH_NODE (gcam->nodes) x,y,z fields with computed coordinates in source image voxel space
+    #        coord_scr = matrix * [x y z]
+    #   #    see GCAMinit() at https://github.com/freesurfer/freesurfer/blob/dev/utils/gcamorph.cpp#L1417
+    #   GCAMinit(gcam, image_header, nullptr, &transform, 0);
+    #   ...
+    #
+    #   # 3. transfer warp field: negative coordinates are skipped
+    #   double const *dptr = warpdata.data();
+    #   int framesize = gcam->depth * gcam->height * gcam->width;
+    #   for (int zp = 0; zp < gcam->depth; zp++) {
+    #     for (int yp = 0; yp < gcam->height; yp++) {
+    #       for (int xp = 0; xp < gcam->width; xp++) {
+    #         if (*dptr > 0) {
+    #            // assume that any coordinate less than zero should be skipped
+    #            gcam->nodes[xp][yp][zp].x = *(dptr);
+    #            gcam->nodes[xp][yp][zp].y = *(dptr + framesize);
+    #            gcam->nodes[xp][yp][zp].z = *(dptr + framesize * 2);
+    #         }
+    #         dptr++;
+    #       }
+    #     }
+    #   }
+    #   ...
+    #
+    """
+    def _saveMGZWarpField(self, coordmap, source, target, matrix):
+        # target crs grid corresponding to 'coordmap'
+        # reshaped to (3, n)
+        compute_type = np.float32
+        trg_crs = (np.arange(x, dtype=compute_type) for x in coordmap.shape[:-1])
+        trg_crs = np.meshgrid(*trg_crs, indexing='ij')
+        trg_crs = np.stack(trg_crs)
+        trg_crs = trg_crs.reshape(3, -1)
+
+        # compute the coordinates in source image voxel space
+        # 'matrix' is vox-to-vox affine matrix
+        # step #2 in fsbindings.write_gca_morph()
+        coord_src = matrix[:3, :3] @ trg_crs + matrix[:3, 3:]
+        # reshape coord_src to [c, r, s] x 3
+        coord_src = coord_src.transpose()
+        coord_src = coord_src.reshape(coordmap.shape)
+
+        # replace 'coordmap' with values from 'coord_src' where 'coordmap[:, :, :, 0]' < 0
+        # step #2 and #3 in fsbindings.write_gca_morph()
+        """
+        # replace 'coordmap' with values from 'coord_src' where 'coordmap' < 0
+        negative = coordmap < 0
+        coordmap_replaced = np.where(negative, coord_src, coordmap)
+        """
+        negative = np.where(coordmap[:, :, :, 0] < 0)
+        coordmap[negative] = coord_src[negative]
+
+        # output the warpfield in mgz format
+        warp = sf.transform.Warp(coordmap, source, target, format=sf.transform.Warp.Format.abs_crs)
+        warp.save(os.path.join(self.savePath, 'template_warp.mgz'))
+
 
     def saveGaussianProbabilities(self, probabilitiesPath):
         # Make output directory
