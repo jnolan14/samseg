@@ -289,6 +289,7 @@ class ThalamicNucleiDTI(MeshModel):
         # load the input volumes
         self.inputSeg = sf.load_volume(self.inputSegFileName)
         # NOTE: we really only have one, should we rename? change from list comp?
+        # TODO: Do we even need this if we call mri_convert to get the resampled volumes????
         self.inputImages = [sf.load_volume(path) for path in self.inputImageFileNames]
         self.correctedImages = [img.copy() for img in self.inputImages]
         # NOTE: do we need this? I don't see it referenced anywhere?
@@ -427,12 +428,21 @@ class ThalamicNucleiDTI(MeshModel):
         # Mask and convert to the target resolution
         images = []
         refGeom = None
-        for i, image in enumerate(self.inputImages):
+        # resample to the targer res, we don't care about the voxels just the grid, nearest is fine.
+        cropRef = segMerged[imageCropping].resize(self.resolution, method='nearest')
+        cropRef_file = os.path.join(self.tempDir, 'crop_ref.mgz')
+        cropRef.save(cropRef_file)
+
+        for i, orig_image in enumerate(self.inputImageFileNames):
             # FS python library does not have cubic interpolation yet, so we'll use mri_convert
+            # resample to the space of the input seg
+            #image = orig_image.resample_like(cropRef, method='cubic')
+
             tempFile = os.path.join(self.tempDir, f"tempImage_{i}.mgz")
-            image[imageCropping].save(tempFile)
+            
+            #image[imageCropping].save(tempFile)
             utils.run(
-                f"mri_convert {tempFile} {tempFile} -odt float -rt cubic -vs {self.resolution} {self.resolution} {self.resolution}"
+                f"mri_convert {orig_image} {tempFile} -odt float -rt cubic -rl {cropRef_file}"
             )
             image = sf.load_volume(tempFile)
 
