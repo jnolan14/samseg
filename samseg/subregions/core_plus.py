@@ -63,6 +63,19 @@ class MeshModelPlus:
         self.fileSuffix = fileSuffix
         self.debug = debug
 
+        # Keep the preliminary segmentation-fit model separate from the
+        # structural image model that later successor stages will construct.
+        self.cheatingMeans = None
+        self.cheatingVariances = None
+
+        # Successor-owned structural lifecycle state. Later commits populate
+        # these fields without reusing the preliminary Gaussian state.
+        self.structuralStage = None
+        self.gmm = None
+        self.bootstrapGMMState = None
+        self.lastValidFittedGMMState = None
+        self.optimizationHistory = []
+
         # Some optimization defaults that should be overwritten by each subclass
         self.cheatingMeshSmoothingSigmas = [3.0, 2.0]
         self.cheatingMaxIterations = [300, 150]
@@ -309,7 +322,8 @@ class MeshModelPlus:
         self.workingImage[mask == 0] = 0
 
         # Get the inital Gaussian parameters
-        self.means, self.variances = self.get_cheating_gaussians(self.sameGaussianParameters)
+        self.cheatingMeans, self.cheatingVariances = self.get_cheating_gaussians(
+            self.sameGaussianParameters)
 
         # Write the inital and cropped/masked images for debugging purposes
         if self.debug:
@@ -344,10 +358,11 @@ class MeshModelPlus:
                 images=[image],
                 boundaryCondition='Sliding',
                 transform=self.transform,
-                means=self.means.reshape((-1, 1)),
-                variances=self.variances.reshape((-1, 1, 1)),
-                mixtureWeights=np.ones(len(self.means), dtype='float32'),
-                numberOfGaussiansPerClass=np.ones(len(self.means), dtype='int32'))
+                means=self.cheatingMeans.reshape((-1, 1)),
+                variances=self.cheatingVariances.reshape((-1, 1, 1)),
+                mixtureWeights=np.ones(len(self.cheatingMeans), dtype='float32'),
+                numberOfGaussiansPerClass=np.ones(
+                    len(self.cheatingMeans), dtype='int32'))
 
             # Step some optimizer stop criteria
             maximalDeformationStopCriterion = 1e-10
