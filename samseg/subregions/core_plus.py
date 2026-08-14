@@ -6,6 +6,8 @@ import surfa as sf
 import scipy.ndimage
 import samseg
 from samseg import gems
+from samseg.io import kvlReadSharedGMMParameters
+from samseg.merge_alphas import kvlGetMergingFractionsTable, kvlMergeAlphas
 from samseg.utilities import requireNumpyArray
 from samseg.subregions import utils
 
@@ -26,6 +28,7 @@ class MeshModelPlus:
         tempDir=None,
         fileSuffix='',
         debug=False,
+        preliminarySharedGMMParametersFileName=None,
         ):
         """
         MeshModel is a generic base class to facilitate GEMS mesh deformation for given ROIs.
@@ -33,15 +36,17 @@ class MeshModelPlus:
         and the following functions MUST be implemented:
 
         self.preprocess_images()         : Precompute the mask, segmentation, and image volumes
-        self.get_cheating_label_groups() : Return the reduced labels group used to fit the mesh to the initial segmentation
-        self.get_cheating_gaussians()    : Return the Gaussian means and variances used to fit the mesh to the initial segmentation
+        self.get_cheating_gaussians()    : Return the artificial preliminary Gaussian parameters
         self.get_label_groups()          : Return the reduced labels group used to fit the mesh to the image
         self.get_gaussian_hyps()         : Return the hyperparameters used to estimate the Gaussian parameters during image-fitting
         self.postprocess_segmentation()  : Update and write the label volumes and discrete segmentation(s)
 
+        Copied region classes that have not yet migrated to shared preliminary
+        parameters must also implement self.get_cheating_label_groups().
+
         Further information is documented in each function definition.
 
-        This is a framework that was meant to facilitate an (almost prefect) port of the subfield matlab code.
+        This is a framework that was meant to facilitate an (almost perfect) port of the subfield matlab code.
         """
 
         # Set some paths
@@ -52,6 +57,8 @@ class MeshModelPlus:
         self.compressionLookupTableFileName = os.path.join(atlasDir, 'compressionLookupTable.txt')
         self.inputImageFileNames = inputImageFileNames
         self.inputSegFileName = inputSegFileName
+        self.preliminarySharedGMMParametersFileName = (
+            preliminarySharedGMMParametersFileName)
 
         # Some settings
         self.meshStiffness = meshStiffness
@@ -67,6 +74,10 @@ class MeshModelPlus:
         # structural image model that later successor stages will construct.
         self.cheatingMeans = None
         self.cheatingVariances = None
+        self.preliminarySharedGMMParameters = None
+        self.preliminaryClassFractions = None
+        self.preliminaryClassNames = None
+        self.preliminaryAlphas = None
 
         # Successor-owned structural lifecycle state. Later commits populate
         # these fields without reusing the preliminary Gaussian state.
@@ -214,6 +225,63 @@ class MeshModelPlus:
 
         return (reducedAlphas, reducingLookupTable)
 
+    def _ensure_preliminary_model_state(self):
+        """Materialize the shared preliminary grouping state when possible.
+
+        Parsing and class construction do not depend on a loaded mesh. Merged
+        alphas are added later, once ``originalAlphas`` is available. Repeated
+        calls only fill missing state.
+
+        The label-list branch temporarily keeps copied region classes runnable
+        until they are migrated to shared-parameter specifications.
+        """
+        parameterFileName = self.preliminarySharedGMMParametersFileName
+        if parameterFileName is None:
+            if not hasattr(self, 'sameGaussianParameters'):
+                labelGroups = self.get_cheating_label_groups()
+                self.sameGaussianParameters = (
+                    self.label_group_names_to_indices(labelGroups))
+
+            if (self.preliminaryAlphas is None
+                    and getattr(self, 'originalAlphas', None) is not None):
+                self.preliminaryAlphas, _ = self.reduce_alphas(
+                    self.sameGaussianParameters)
+            return
+
+        if self.preliminarySharedGMMParameters is None:
+            sharedGMMParameters = kvlReadSharedGMMParameters(parameterFileName)
+            if not sharedGMMParameters:
+                raise ValueError(
+                    'Preliminary shared-GMM parameter file defines no classes')
+            if any(parameter.numberOfComponents != 1
+                   for parameter in sharedGMMParameters):
+                raise ValueError(
+                    'Preliminary segmentation fitting requires exactly one '
+                    'Gaussian per class')
+            self.preliminarySharedGMMParameters = sharedGMMParameters
+
+        if self.preliminaryClassFractions is None:
+            if not hasattr(self, 'names'):
+                return
+            classFractions, classNames = kvlGetMergingFractionsTable(
+                self.names, self.preliminarySharedGMMParameters)
+            if np.any(np.count_nonzero(classFractions, axis=0) != 1):
+                raise ValueError(
+                    'Each atlas structure in a preliminary shared-GMM file '
+                    'must match exactly one class')
+            FreeSurferLabels = np.asarray(self.FreeSurferLabels)
+            self.preliminaryClassFractions = classFractions
+            self.preliminaryClassNames = classNames
+            self.sameGaussianParameters = [
+                FreeSurferLabels[fractions > 0].tolist()
+                for fractions in classFractions
+            ]
+
+        if (self.preliminaryAlphas is None
+                and getattr(self, 'originalAlphas', None) is not None):
+            self.preliminaryAlphas = kvlMergeAlphas(
+                self.originalAlphas, self.preliminaryClassFractions)
+
     def crop_image_by_atlas(self, image):
         """
         Crop image to the aligned atlas image. Also construct a 3-D affine transformation that will later be used
@@ -309,21 +377,27 @@ class MeshModelPlus:
         self.originalNodePositions = self.mesh.points.copy(order='K')
         self.originalAlphas = self.mesh.alphas.copy(order='K')
 
-        # Compute the cheating Gaussian label groups
-        labelGroups = self.get_cheating_label_groups()
-        self.sameGaussianParameters = self.label_group_names_to_indices(labelGroups)
-
-        # Compute the reduced alphas - those referring to the super-structures
-        self.reducedAlphas, _ = self.reduce_alphas(self.sameGaussianParameters)
-        self.mesh.alphas = self.reducedAlphas 
+        # Materialize the shared preliminary grouping and its merged alphas.
+        self._ensure_preliminary_model_state()
+        self.mesh.alphas = self.preliminaryAlphas
         mask = (self.mesh.rasterize(self.workingImageShape).sum(-1) / 65535) > 0.99
         if self.cheatingAlphaMaskStrel > 0:
             mask = scipy.ndimage.morphology.binary_erosion(mask, utils.spherical_strel(self.cheatingAlphaMaskStrel), border_value=1)
         self.workingImage[mask == 0] = 0
 
-        # Get the inital Gaussian parameters
-        self.cheatingMeans, self.cheatingVariances = self.get_cheating_gaussians(
-            self.sameGaussianParameters)
+        # Get the region-specific artificial Gaussian parameters.
+        self.cheatingMeans, self.cheatingVariances = (
+            self.get_cheating_gaussians(self.sameGaussianParameters))
+
+        if self.preliminarySharedGMMParameters is not None:
+            self.cheatingMeans = np.asarray(self.cheatingMeans)
+            self.cheatingVariances = np.asarray(self.cheatingVariances)
+            expectedShape = (len(self.preliminarySharedGMMParameters),)
+            if (self.cheatingMeans.shape != expectedShape
+                    or self.cheatingVariances.shape != expectedShape):
+                raise ValueError(
+                    'Preliminary means and variances must contain one scalar '
+                    'per shared-GMM class')
 
         # Write the inital and cropped/masked images for debugging purposes
         if self.debug:
@@ -345,7 +419,7 @@ class MeshModelPlus:
         for multiResolutionLevel, meshSmoothingSigma in enumerate(self.cheatingMeshSmoothingSigmas):
 
             # Set mesh alphas
-            self.mesh.alphas = self.reducedAlphas
+            self.mesh.alphas = self.preliminaryAlphas
 
             # It's good to smooth the mesh, otherwise we get weird compressions of the mesh along the boundaries
             if meshSmoothingSigma > 0:

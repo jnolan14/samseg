@@ -46,6 +46,11 @@ def test_thalamic_nuclei_plus_preserves_legacy_constructor_state(
         'gmm',
         'lastValidFittedGMMState',
         'optimizationHistory',
+        'preliminaryAlphas',
+        'preliminaryClassFractions',
+        'preliminaryClassNames',
+        'preliminarySharedGMMParameters',
+        'preliminarySharedGMMParametersFileName',
         'structuralStage',
     }
 
@@ -70,6 +75,11 @@ def test_successor_declares_structural_lifecycle_state(tmp_path, monkeypatch):
 
     assert model.cheatingMeans is None
     assert model.cheatingVariances is None
+    assert model.preliminarySharedGMMParametersFileName is None
+    assert model.preliminarySharedGMMParameters is None
+    assert model.preliminaryClassFractions is None
+    assert model.preliminaryClassNames is None
+    assert model.preliminaryAlphas is None
     assert model.structuralStage is None
     assert model.gmm is None
     assert model.bootstrapGMMState is None
