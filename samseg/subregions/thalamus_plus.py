@@ -5,10 +5,10 @@ import scipy.ndimage
 import surfa as sf
 
 from samseg.subregions import utils
-from samseg.subregions.core import MeshModel
+from samseg.subregions.core_plus import MeshModelPlus
 
 
-class ThalamicNucleiPlus(MeshModel):
+class ThalamicNucleiPlus(MeshModelPlus):
 
     def __init__(self, **kwargs):
         atlasDir = os.path.join(os.environ.get('FREESURFER_HOME'), 'average', 'ThalamicNuclei', 'atlas')
