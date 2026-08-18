@@ -1,4 +1,5 @@
 import os
+import shlex
 import shutil
 import tempfile
 import numpy as np
@@ -74,8 +75,8 @@ class MeshModelPlus:
         self.fileSuffix = fileSuffix
         self.debug = debug
 
-        # Keep the preliminary segmentation-fit model separate from the
-        # structural image model that later successor stages will construct.
+        # Preliminary state belongs only to the coarse, localizer-driven mesh
+        # fit and remains separate from the ordinary intensity model.
         self.cheatingMeans = None
         self.cheatingVariances = None
         self.preliminarySharedGMMParameters = None
@@ -86,11 +87,17 @@ class MeshModelPlus:
         self.preliminaryLocalizerLabelGroups = None
         self.preliminaryAlphas = None
 
-        # Successor-owned structural lifecycle state. Later commits populate
-        # these fields without reusing the preliminary Gaussian state.
-        self.structuralInitializationSegmentation = None
-        self.structuralInitializationMask = None
-        self.structuralStage = None
+        # The fitted preliminary mesh later supplies full-label evidence and
+        # valid support for initializing the ordinary intensity model.
+        self.initializationSegmentation = None
+        self.initializationMask = None
+        # The first intensity supplies the whole-field prior geometry; the
+        # aligned stack is reserved for intensity-prior and hyperparameter use.
+        self.intensityPriorReferenceImage = None
+        self.intensityPriorImage = None
+        # This stage belongs to the ordinary intensity model. Descendants that
+        # add diffusion own their separate model state and lifecycle.
+        self.intensityStage = None
         self.gmm = None
         self.bootstrapGMMState = None
         self.lastValidFittedGMMState = None
@@ -169,10 +176,11 @@ class MeshModelPlus:
         self.warpedMeshNoAffineFileName = os.path.join(self.tempDir, 'warpedOriginalMeshNoAffine.txt')
 
         # The input segmentation remains the immutable source localizer. Derived
-        # preliminary and structural-initialization states are stored separately.
+        # preliminary and full-label initialization states are stored separately.
         self.inputSeg = sf.load_volume(self.inputSegFileName)
         self.inputImages = [sf.load_volume(path) for path in self.inputImageFileNames]
         self.correctedImages = [img.copy() for img in self.inputImages]
+        self.intensityPriorReferenceImage = self.inputImages[0]
         self.highResImage = np.mean(self.inputImages[0].geom.voxsize) < 0.99
 
         # Now we define a set of volume members that must be properly computed during
@@ -188,13 +196,81 @@ class MeshModelPlus:
                                           affine atlas registration.
             2. self.synthImage : A synthetic image generated from the input segmentation, used for the initial
                                 fitting of the mesh to the subject (the `cheating` step).
-            3. self.processedImage: An image (or set of images represented by each frame) used for the primary
-                                    mesh fitting. It is expected that this image has been properly resampled
-                                    to the working target resolution.
+            3. self.processedImage: An independently resampled regional image (or set of images represented
+                                    by each frame) used for the primary EM/image-fitting stage. It is expected
+                                    that this image has been properly resampled to the working target resolution.
 
         It is expected that these are surfa.Volume objects with proper geometry information.
         """
         raise NotImplementedError('All subclasses of MeshModel must implement the preprocess_images() function!')
+
+    def _resample_and_stack_intensity_channels(
+            self, sourceFileNames, referenceImage, outputPrefix, mask=None):
+        """Resample preregistered intensity channels onto a supplied grid.
+
+        Parameters
+        ----------
+        sourceFileNames : sequence of str
+            Intensity image files in channel order. Their world coordinates
+            must already describe the same anatomy.
+        referenceImage : surfa.Volume
+            Three-dimensional target geometry. Its voxel values are ignored.
+        outputPrefix : str
+            Prefix used for temporary reference and channel files.
+        mask : surfa.Volume, optional
+            Three-dimensional mask already expressed on ``referenceImage``.
+
+        Returns
+        -------
+        surfa.Volume
+            Resampled channels stacked along the frame axis.
+
+        Notes
+        -----
+        This reconciles sampling grids; it does not estimate registration.
+        Callers choose the target geometry and semantic support, then supply
+        the authoritative stage sources directly to avoid chained
+        interpolation.
+        """
+        if not sourceFileNames:
+            raise ValueError('At least one intensity image is required')
+        if referenceImage.data.ndim != 3:
+            raise ValueError('Intensity reference image must be three-dimensional')
+        if mask is not None:
+            if mask.data.ndim != 3:
+                raise ValueError('Intensity mask must be three-dimensional')
+            if not sf.transform.image_geometry_equal(
+                    mask, referenceImage, tol=1e-5):
+                raise ValueError(
+                    'Intensity mask must match the supplied reference geometry')
+
+        referenceFileName = os.path.join(
+            self.tempDir, f'{outputPrefix}Reference.mgz')
+        referenceImage.save(referenceFileName)
+
+        channels = []
+        for channelNumber, sourceFileName in enumerate(sourceFileNames):
+            resampledFileName = os.path.join(
+                self.tempDir, f'{outputPrefix}_{channelNumber}.mgz')
+            utils.run(
+                f'mri_convert {shlex.quote(sourceFileName)} '
+                f'{shlex.quote(resampledFileName)} -odt float -rt cubic '
+                f'-rl {shlex.quote(referenceFileName)}')
+            image = sf.load_volume(resampledFileName)
+
+            if (image.data.ndim != 3
+                    or not sf.transform.image_geometry_equal(
+                        image, referenceImage, tol=1e-5)):
+                raise RuntimeError(
+                    'Intensity channel '
+                    f'{channelNumber} ({sourceFileName}) did not match the '
+                    'requested reference geometry')
+
+            if mask is not None:
+                image[mask == 0] = 0
+            channels.append(image.data)
+
+        return referenceImage.new(np.stack(channels, axis=-1))
 
     def label_group_names_to_indices(self, labelNames):
         """
@@ -629,7 +705,7 @@ class MeshModelPlus:
             target[source == label] = means[classNumber]
         return segmentation.new(target)
 
-    def _reconstruct_structural_initialization_state(self):
+    def _reconstruct_initialization_state(self):
         """Reconstruct full atlas labels after preliminary mesh fitting.
 
         The preliminary target deliberately suppresses anatomical distinctions
@@ -642,8 +718,9 @@ class MeshModelPlus:
         Returns
         -------
         tuple of surfa.Volume
-            Full-label structural-initialization segmentation and its valid
-            fitted-atlas support mask, both in the first structural image grid.
+            Full-label initialization segmentation and its valid fitted-atlas
+            support mask, both in the first intensity image grid. This state
+            initializes the subsequent ordinary intensity model.
 
         Raises
         ------
@@ -662,7 +739,7 @@ class MeshModelPlus:
             name for name, value in requiredState.items() if value is None]
         if missingState:
             raise RuntimeError(
-                'Cannot reconstruct structural initialization before the '
+                'Cannot reconstruct initialization state before the '
                 'preliminary fit has materialized: '
                 + ', '.join(missingState))
 
@@ -922,12 +999,11 @@ class MeshModelPlus:
                     break
 
         # Restore full anatomy while the mesh still occupies its fitted subject
-        # coordinates, then materialize the structural-initialization state.
+        # coordinates, then materialize ordinary-model initialization evidence.
         self.mesh.alphas = self.originalAlphas 
         if self.preliminarySharedGMMParameters is not None:
-            (self.structuralInitializationSegmentation,
-             self.structuralInitializationMask) = (
-                self._reconstruct_structural_initialization_state())
+            (self.initializationSegmentation,
+             self.initializationMask) = self._reconstruct_initialization_state()
 
         # Assign fitted positions to the first training-subject warp before
         # returning the collection to native atlas space.

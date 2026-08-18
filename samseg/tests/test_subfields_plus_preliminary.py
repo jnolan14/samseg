@@ -636,7 +636,7 @@ def test_reconstruction_uses_fitted_full_priors_with_coarse_class_evidence():
     model.labelMapping = sf.LabelLookup()
 
     segmentation, support = (
-        model._reconstruct_structural_initialization_state())
+        model._reconstruct_initialization_state())
 
     # Source VDC can become thalamus and source thalamus can become VDC.
     np.testing.assert_array_equal(
@@ -650,7 +650,7 @@ def test_reconstruction_runs_before_fitted_mesh_leaves_subject_space():
     source = inspect.getsource(MeshModelPlus.fit_mesh_to_seg)
 
     assert source.index('self.mesh.alphas = self.originalAlphas') < source.index(
-        '_reconstruct_structural_initialization_state') < source.index(
+        '_reconstruct_initialization_state') < source.index(
             'set_positions') < source.index('inverseTransform')
 
 

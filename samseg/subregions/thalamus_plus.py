@@ -72,8 +72,13 @@ class ThalamicNucleiPlus(MeshModelPlus):
         self.atlasTargetSmoothing = 'forward'
 
     def preprocess_images(self):
-        """
-        Preprocess the input seg and images
+        """Prepare preliminary targets and ordinary intensity grids.
+
+        Preregistered intensity channels are sampled independently from their
+        supplied sources. The unmasked intensity-prior stack preserves the
+        complete first-channel field of view for later hyperparameter support;
+        the masked ``processedImage`` is a separate regional EM representation
+        at ``self.resolution``.
         """
 
         # Output/postprocessing uses the canonical thalamus segmentation labels.
@@ -109,24 +114,29 @@ class ThalamicNucleiPlus(MeshModelPlus):
         mask = scipy.ndimage.morphology.binary_dilation(self.synthImage > 1, structure=struct, iterations=2)
         imageMask = self.synthImage.new(mask)
 
-        # Mask and convert to the target resolution
-        images = []
-        for i, image in enumerate(self.inputImages):
+        # Preserve the complete first-channel field of view so later
+        # hyperparameter support is not constrained by the regional EM crop.
+        # Fitted anatomical labels are materialized after preliminary fitting.
+        self.intensityPriorImage = (
+            self._resample_and_stack_intensity_channels(
+                self.inputImageFileNames,
+                self.intensityPriorReferenceImage,
+                'intensityPrior'))
 
-            # FS python library does not have cubic interpolation yet, so we'll use mri_convert
-            tempFile = os.path.join(self.tempDir, 'tempImage.mgz')
-            image[imageCropping].save(tempFile)
-            utils.run(f'mri_convert {tempFile} {tempFile} -odt float -rt cubic -vs {self.resolution} {self.resolution} {self.resolution}')
-            image = sf.load_volume(tempFile)
-            
-            # Resample and apply the image mask in high-resolution target space
-            imageMask = imageMask.resample_like(image, method='nearest')
-            image[imageMask == 0] = 0            
-            images.append(image.data)
-            self.longMask = imageMask
-
-        # Define the pre-processed target image
-        self.processedImage = image.new(np.stack(images, axis=-1))
+        # The regional EM grid keeps the historical isotropic resolution. Crop
+        # indices never cross voxel grids: every channel is resampled directly
+        # from its preregistered source onto this geometry.
+        regionalReference = self.synthImage[imageCropping].resize(
+            self.resolution, method='nearest')
+        # Materialize one shared regional mask so channel processing cannot
+        # accumulate channel-dependent mask interpolation.
+        self.longMask = imageMask.resample_like(
+            regionalReference, method='nearest')
+        self.processedImage = self._resample_and_stack_intensity_channels(
+            self.inputImageFileNames,
+            regionalReference,
+            'regionalIntensity',
+            mask=self.longMask)
 
     def _get_preliminary_affine_support_labels(self):
         """Return localizer labels supporting thalamus affine alignment."""
@@ -221,16 +231,16 @@ class ThalamicNucleiPlus(MeshModelPlus):
         return labelGroups
 
     def get_gaussian_hyps(self, sameGaussianParameters, mesh):
-        """Estimate structural Gaussian hyperparameters after atlas fitting.
+        """Estimate intensity Gaussian hyperparameters after atlas fitting.
 
         Masks come from the full-label reconstruction produced by the fitted
         preliminary mesh, not from source-localizer boundaries that were
         deliberately collapsed during preliminary deformation.
         """
-        if (self.structuralInitializationSegmentation is None
-                or self.structuralInitializationMask is None):
+        if (self.initializationSegmentation is None
+                or self.initializationMask is None):
             raise RuntimeError(
-                'fit_mesh_to_seg() must reconstruct structural initialization '
+                'fit_mesh_to_seg() must reconstruct initialization state '
                 'before Gaussian hyperparameters are estimated')
 
         nHyper = np.zeros(len(sameGaussianParameters))
@@ -245,9 +255,9 @@ class ThalamicNucleiPlus(MeshModelPlus):
 
             if len(labels) > 0:
                 MASK = np.isin(
-                    self.structuralInitializationSegmentation.data,
+                    self.initializationSegmentation.data,
                     labels)
-                MASK &= self.structuralInitializationMask.data
+                MASK &= self.initializationMask.data
                 radius = np.round(1 / np.mean(DATA.geom.voxsize))
                 MASK = scipy.ndimage.morphology.binary_erosion(MASK, utils.spherical_strel(radius), border_value=1)
                 total_mask = MASK & (DATA.data > 0)

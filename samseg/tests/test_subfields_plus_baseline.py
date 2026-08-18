@@ -45,6 +45,8 @@ def test_thalamic_nuclei_plus_preserves_legacy_constructor_state(
         'cheatingVariances',
         'gmm',
         'inputSegmentationSchemaOverride',
+        'intensityPriorImage',
+        'intensityPriorReferenceImage',
         'lastValidFittedGMMState',
         'modelPolicy',
         'modelPolicyFileName',
@@ -59,13 +61,13 @@ def test_thalamic_nuclei_plus_preserves_legacy_constructor_state(
         'preliminaryModelProfiles',
         'preliminarySharedGMMParameters',
         'preliminarySharedGMMParametersFileName',
-        'structuralInitializationMask',
-        'structuralInitializationSegmentation',
-        'structuralStage',
+        'initializationMask',
+        'initializationSegmentation',
+        'intensityStage',
     }
 
 
-def test_preliminary_gaussians_are_isolated_from_structural_state():
+def test_preliminary_gaussians_are_isolated_from_intensity_state():
     preliminary_attributes = (
         _self_attributes(MeshModelPlus.prepare_for_seg_fitting)
         | _self_attributes(MeshModelPlus.fit_mesh_to_seg)
@@ -75,7 +77,7 @@ def test_preliminary_gaussians_are_isolated_from_structural_state():
     assert not {'means', 'variances'} & preliminary_attributes
 
 
-def test_successor_declares_structural_lifecycle_state(tmp_path, monkeypatch):
+def test_successor_declares_intensity_lifecycle_state(tmp_path, monkeypatch):
     monkeypatch.setenv('FREESURFER_HOME', str(tmp_path / 'freesurfer'))
     model = ThalamicNucleiPlus(
         outDir=str(tmp_path / 'output'),
@@ -98,9 +100,11 @@ def test_successor_declares_structural_lifecycle_state(tmp_path, monkeypatch):
     assert model.preliminaryLocalizerLookupTableFileName is None
     assert model.preliminaryLocalizerLabelGroups is None
     assert model.preliminaryAlphas is None
-    assert model.structuralInitializationSegmentation is None
-    assert model.structuralInitializationMask is None
-    assert model.structuralStage is None
+    assert model.initializationSegmentation is None
+    assert model.initializationMask is None
+    assert model.intensityPriorReferenceImage is None
+    assert model.intensityPriorImage is None
+    assert model.intensityStage is None
     assert model.gmm is None
     assert model.bootstrapGMMState is None
     assert model.lastValidFittedGMMState is None

@@ -462,9 +462,9 @@ def test_thalamus_hyperparameters_use_fitted_atlas_reconstruction(
         [[[20.0]], [[100.0]]], dtype='float32'))]
     model.inputSeg = sf.Volume(np.array(
         [[[8101]], [[28]]], dtype='int32'))
-    model.structuralInitializationSegmentation = sf.Volume(np.array(
+    model.initializationSegmentation = sf.Volume(np.array(
         [[[28]], [[8101]]], dtype='int32'))
-    model.structuralInitializationMask = sf.Volume(np.ones(
+    model.initializationMask = sf.Volume(np.ones(
         (2, 1, 1), dtype='bool'))
     monkeypatch.setattr(
         thalamus_plus.scipy.ndimage.morphology,
