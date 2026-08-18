@@ -10,6 +10,7 @@ from samseg.io import kvlReadSharedGMMParameters
 from samseg.merge_alphas import kvlGetMergingFractionsTable, kvlMergeAlphas
 from samseg.utilities import requireNumpyArray
 from samseg.subregions import utils
+from samseg.subregions.model_policy import SubregionModelPolicy
 
 
 class MeshModelPlus:
@@ -59,6 +60,9 @@ class MeshModelPlus:
         self.inputSegFileName = inputSegFileName
         self.preliminarySharedGMMParametersFileName = (
             preliminarySharedGMMParametersFileName)
+        self.preliminaryModelProfileName = None
+        self.preliminaryLocalizerLookupTableFileName = None
+        self.modelPolicyFileName = None
 
         # Some settings
         self.meshStiffness = meshStiffness
@@ -77,10 +81,15 @@ class MeshModelPlus:
         self.preliminarySharedGMMParameters = None
         self.preliminaryClassFractions = None
         self.preliminaryClassNames = None
+        self.modelPolicy = None
+        # These localizer labels never contain numeric atlas memberships.
+        self.preliminaryLocalizerLabelGroups = None
         self.preliminaryAlphas = None
 
         # Successor-owned structural lifecycle state. Later commits populate
         # these fields without reusing the preliminary Gaussian state.
+        self.structuralInitializationSegmentation = None
+        self.structuralInitializationMask = None
         self.structuralStage = None
         self.gmm = None
         self.bootstrapGMMState = None
@@ -159,7 +168,8 @@ class MeshModelPlus:
         self.warpedMeshFileName = os.path.join(self.tempDir, 'warpedOriginalMesh.txt')
         self.warpedMeshNoAffineFileName = os.path.join(self.tempDir, 'warpedOriginalMeshNoAffine.txt')
 
-        # Read the input volumes (images and reference segmentation)
+        # The input segmentation remains the immutable source localizer. Derived
+        # preliminary and structural-initialization states are stored separately.
         self.inputSeg = sf.load_volume(self.inputSegFileName)
         self.inputImages = [sf.load_volume(path) for path in self.inputImageFileNames]
         self.correctedImages = [img.copy() for img in self.inputImages]
@@ -272,15 +282,445 @@ class MeshModelPlus:
             FreeSurferLabels = np.asarray(self.FreeSurferLabels)
             self.preliminaryClassFractions = classFractions
             self.preliminaryClassNames = classNames
+            # Preserve atlas/compression-LUT labels only for alpha reduction.
             self.sameGaussianParameters = [
                 FreeSurferLabels[fractions > 0].tolist()
                 for fractions in classFractions
             ]
 
+        if (self.preliminaryLocalizerLabelGroups is None
+                and self.preliminaryLocalizerLookupTableFileName is not None):
+            if self.modelPolicy is None:
+                if self.modelPolicyFileName is None:
+                    self.modelPolicy = SubregionModelPolicy()
+                else:
+                    self.modelPolicy = SubregionModelPolicy.read(
+                        self.modelPolicyFileName)
+            preliminaryLocalizerLookupTable = sf.load_label_lookup(
+                self.preliminaryLocalizerLookupTableFileName)
+            self.preliminaryLocalizerLabelGroups = (
+                self._build_preliminary_localizer_label_groups(
+                    self.preliminarySharedGMMParameters,
+                    preliminaryLocalizerLookupTable))
+
         if (self.preliminaryAlphas is None
                 and getattr(self, 'originalAlphas', None) is not None):
             self.preliminaryAlphas = kvlMergeAlphas(
                 self.originalAlphas, self.preliminaryClassFractions)
+
+    def _build_preliminary_localizer_label_groups(
+            self, sharedGMMParameters, localizerLookupTable):
+        """Build class-aligned groups from a bounded localizer vocabulary.
+
+        Parameters
+        ----------
+        sharedGMMParameters : sequence
+            Parsed shared-GMM rows defining class names and search strings.
+        localizerLookupTable : surfa.LabelLookup
+            Selected model's bounded localizer label vocabulary.
+
+        Returns
+        -------
+        list of list of int
+            Localizer labels assigned to each shared-GMM class in row order.
+
+        Raises
+        ------
+        ValueError
+            If policy references are invalid or a vocabulary label cannot be
+            assigned to exactly one preliminary class.
+        """
+        classNames = [
+            parameter.mergedName for parameter in sharedGMMParameters]
+        if not classNames:
+            raise ValueError(
+                'Preliminary shared-GMM parameters define no classes')
+        if len(classNames) != len(set(classNames)):
+            raise ValueError('Preliminary class names must be unique')
+
+        policyMemberships = (
+            self.modelPolicy.preliminaryLocalizerLabelMemberships)
+        unknownClasses = sorted(set(policyMemberships) - set(classNames))
+        if unknownClasses:
+            raise ValueError(
+                'Subregion model policy references unknown preliminary '
+                'classes: ' + ', '.join(unknownClasses))
+
+        classNumbers = {
+            className: classNumber
+            for classNumber, className in enumerate(classNames)
+        }
+        exactOwners = {
+            label: classNumbers[className]
+            for className, labels in policyMemberships.items()
+            for label in labels
+        }
+        vocabularyLabels = {
+            int(label) for label in localizerLookupTable.keys()}
+        missingPolicyLabels = sorted(set(exactOwners) - vocabularyLabels)
+        if missingPolicyLabels:
+            raise ValueError(
+                'Subregion model policy references labels absent from the '
+                'selected localizer vocabulary: '
+                + ', '.join(str(label) for label in missingPolicyLabels))
+
+        groups = [[] for _ in sharedGMMParameters]
+        unmatched = []
+        ambiguous = []
+        inferredPolicyLabels = []
+        for label, element in sorted(localizerLookupTable.items()):
+            label = int(label)
+            matchingClasses = [
+                classNumber
+                for classNumber, parameter
+                in enumerate(sharedGMMParameters)
+                if any(searchString in element.name
+                       for searchString in parameter.searchStrings)
+            ]
+            if len(matchingClasses) == 1:
+                groups[matchingClasses[0]].append(label)
+                if label in exactOwners:
+                    inferredPolicyLabels.append((
+                        label,
+                        element.name,
+                        classNames[matchingClasses[0]],
+                    ))
+            elif not matchingClasses:
+                exactOwner = exactOwners.get(label)
+                if exactOwner is None:
+                    unmatched.append((label, element.name))
+                else:
+                    groups[exactOwner].append(label)
+            else:
+                ambiguous.append((
+                    label,
+                    element.name,
+                    [classNames[classNumber]
+                     for classNumber in matchingClasses],
+                ))
+
+        if inferredPolicyLabels:
+            details = ', '.join(
+                f'{label} ({name}: {className})'
+                for label, name, className in inferredPolicyLabels)
+            raise ValueError(
+                'Subregion model policy may only assign labels unmatched by '
+                f'shared-parameter inference; already inferred: {details}')
+        if unmatched:
+            details = ', '.join(
+                f'{label} ({name})' for label, name in unmatched)
+            raise ValueError(
+                'Selected localizer vocabulary contains labels unmatched by '
+                f'the preliminary model: {details}')
+        if ambiguous:
+            details = ', '.join(
+                f'{label} ({name}: {"/".join(matches)})'
+                for label, name, matches in ambiguous)
+            raise ValueError(
+                'Selected localizer vocabulary contains labels assigned to '
+                f'multiple preliminary classes: {details}')
+
+        emptyClasses = [
+            className for className, labels in zip(classNames, groups)
+            if not labels
+        ]
+        if emptyClasses:
+            raise ValueError(
+                'Preliminary classes have no labels in the selected '
+                'localizer vocabulary: ' + ', '.join(emptyClasses))
+        return groups
+
+    def _configure_preliminary_model_profile(
+            self, profiles, requestedProfileName=None):
+        """Select and configure one compatible preliminary model profile.
+
+        Parameters
+        ----------
+        profiles : dict
+            Region-provided mapping from profile names to resolved shared-GMM,
+            localizer-LUT, and optional model-policy paths.
+        requestedProfileName : str, optional
+            Explicit profile selection. When omitted, canonical input naming
+            and bounded localizer vocabularies are used for inference.
+
+        Returns
+        -------
+        str
+            Selected profile name.
+        """
+        if not isinstance(profiles, dict) or not profiles:
+            raise ValueError(
+                'At least one preliminary model profile is required')
+
+        requiredFields = {
+            'sharedGMMParametersFileName',
+            'localizerLookupTableFileName',
+        }
+        optionalFields = {'modelPolicyFileName'}
+        supportedFields = requiredFields | optionalFields
+        normalizedProfiles = {}
+        profileVocabularies = {}
+        for profileName, profile in profiles.items():
+            if not isinstance(profileName, str) or not profileName:
+                raise ValueError(
+                    'Preliminary model profile names must be nonempty strings')
+            if not isinstance(profile, dict):
+                raise ValueError(
+                    f'Preliminary model profile {profileName!r} must be a '
+                    'mapping')
+            missingFields = sorted(requiredFields - set(profile))
+            unsupportedFields = sorted(set(profile) - supportedFields)
+            if missingFields or unsupportedFields:
+                details = []
+                if missingFields:
+                    details.append('missing ' + ', '.join(missingFields))
+                if unsupportedFields:
+                    details.append(
+                        'unsupported ' + ', '.join(unsupportedFields))
+                raise ValueError(
+                    f'Invalid preliminary model profile {profileName!r}: '
+                    + '; '.join(details))
+
+            normalizedProfile = {
+                'sharedGMMParametersFileName':
+                    profile['sharedGMMParametersFileName'],
+                'localizerLookupTableFileName':
+                    profile['localizerLookupTableFileName'],
+                'modelPolicyFileName': profile.get('modelPolicyFileName'),
+            }
+            localizerLookupTableFileName = normalizedProfile[
+                'localizerLookupTableFileName']
+            if not os.path.isfile(localizerLookupTableFileName):
+                raise ValueError(
+                    f'Preliminary model profile {profileName!r} localizer '
+                    'lookup table does not exist: '
+                    f'{localizerLookupTableFileName}')
+            localizerLookupTable = sf.load_label_lookup(
+                localizerLookupTableFileName)
+            normalizedProfiles[profileName] = normalizedProfile
+            profileVocabularies[profileName] = {
+                int(label) for label in localizerLookupTable.keys()}
+
+        if requestedProfileName is not None:
+            if requestedProfileName not in normalizedProfiles:
+                availableProfiles = ', '.join(sorted(normalizedProfiles))
+                raise ValueError(
+                    f'Unknown preliminary model profile '
+                    f'{requestedProfileName!r}; available profiles: '
+                    f'{availableProfiles}')
+            selectedProfileName = requestedProfileName
+        else:
+            fileName = os.path.basename(self.inputSegFileName).lower()
+            for suffix in ('.nii.gz', '.mgz', '.mgh', '.nii'):
+                if fileName.endswith(suffix):
+                    fileName = fileName[:-len(suffix)]
+                    break
+            provenanceMatches = [
+                profileName for profileName in normalizedProfiles
+                if (fileName == profileName.lower()
+                    or fileName.endswith('+' + profileName.lower()))
+            ]
+            if len(provenanceMatches) > 1:
+                raise ValueError(
+                    'Input segmentation name matches multiple preliminary '
+                    'model profiles')
+            selectedProfileName = (
+                provenanceMatches[0] if provenanceMatches else None)
+
+        if not hasattr(self, 'inputSeg'):
+            raise ValueError(
+                'Input segmentation must be loaded before selecting a '
+                'preliminary model profile')
+        observedLabels = set(
+            np.unique(self.inputSeg.data).astype(int).tolist())
+        if selectedProfileName is None:
+            compatibleProfiles = [
+                profileName
+                for profileName, vocabulary in profileVocabularies.items()
+                if observedLabels <= vocabulary
+            ]
+            if len(compatibleProfiles) == 1:
+                selectedProfileName = compatibleProfiles[0]
+            elif not compatibleProfiles:
+                raise ValueError(
+                    'Input segmentation labels are unsupported by the '
+                    'available preliminary model profiles')
+            else:
+                raise ValueError(
+                    'Unable to distinguish compatible preliminary model '
+                    'profiles; select one explicitly')
+
+        unsupportedLabels = sorted(
+            observedLabels - profileVocabularies[selectedProfileName])
+        if unsupportedLabels:
+            raise ValueError(
+                f'Input segmentation contains labels outside preliminary '
+                f'model profile {selectedProfileName!r}: '
+                + ', '.join(str(label) for label in unsupportedLabels))
+
+        selectedProfile = normalizedProfiles[selectedProfileName]
+        for fieldName, description in (
+                ('sharedGMMParametersFileName',
+                 'shared-GMM parameter file'),
+                ('modelPolicyFileName', 'model policy file')):
+            fileName = selectedProfile[fieldName]
+            if fileName is not None and not os.path.isfile(fileName):
+                raise ValueError(
+                    f'Preliminary model profile {selectedProfileName!r} '
+                    f'{description} does not exist: {fileName}')
+
+        self.preliminaryModelProfileName = selectedProfileName
+        self.preliminarySharedGMMParametersFileName = selectedProfile[
+            'sharedGMMParametersFileName']
+        self.preliminaryLocalizerLookupTableFileName = selectedProfile[
+            'localizerLookupTableFileName']
+        self.modelPolicyFileName = selectedProfile['modelPolicyFileName']
+        return selectedProfileName
+
+    def _build_preliminary_synthetic_image(self, segmentation):
+        """Construct the artificial segmentation used for preliminary fitting.
+
+        Parameters
+        ----------
+        segmentation : surfa.Volume
+            Original input localizer. Its data are not modified.
+
+        Returns
+        -------
+        surfa.Volume
+            Class-reduced artificial target in the input geometry.
+
+        Raises
+        ------
+        ValueError
+            If model state is incomplete or observed labels are unsupported.
+        """
+        self._ensure_preliminary_model_state()
+        labelGroups = self.preliminaryLocalizerLabelGroups
+        if labelGroups is None:
+            raise ValueError(
+                'A localizer vocabulary is required to construct the '
+                'preliminary synthetic segmentation')
+
+        means, _ = self.get_cheating_gaussians(labelGroups)
+        means = np.asarray(means)
+        expectedShape = (len(labelGroups),)
+        if means.shape != expectedShape:
+            raise ValueError(
+                'Preliminary means must contain one scalar per class')
+
+        labelToClass = {
+            label: classNumber
+            for classNumber, labels in enumerate(labelGroups)
+            for label in labels
+        }
+        observedLabels = set(
+            np.unique(segmentation.data).astype(int).tolist())
+        unsupportedLabels = sorted(observedLabels - set(labelToClass))
+        if unsupportedLabels:
+            raise ValueError(
+                'Input segmentation contains labels outside the selected '
+                'preliminary localizer vocabulary: '
+                + ', '.join(str(label) for label in unsupportedLabels))
+
+        source = segmentation.data
+        target = np.zeros(source.shape, dtype='float32')
+        for label, classNumber in labelToClass.items():
+            target[source == label] = means[classNumber]
+        return segmentation.new(target)
+
+    def _reconstruct_structural_initialization_state(self):
+        """Reconstruct full atlas labels after preliminary mesh fitting.
+
+        The preliminary target deliberately suppresses anatomical distinctions
+        that the coarse localizer cannot support reliably. This method restores
+        full labels from the subject-fitted atlas priors while retaining only
+        the coarse class evidence used for that fit. Optional region-specific
+        refinements, such as SynthSeg choroid handling, operate on the resulting
+        state later.
+
+        Returns
+        -------
+        tuple of surfa.Volume
+            Full-label structural-initialization segmentation and its valid
+            fitted-atlas support mask, both in the first structural image grid.
+
+        Raises
+        ------
+        RuntimeError
+            If the configured preliminary model or fitted mesh state is
+            incomplete.
+        """
+        requiredState = {
+            'mesh': getattr(self, 'mesh', None),
+            'workingImage': getattr(self, 'workingImage', None),
+            'originalAlphas': getattr(self, 'originalAlphas', None),
+            'preliminaryClassFractions': self.preliminaryClassFractions,
+            'cheatingMeans': self.cheatingMeans,
+        }
+        missingState = [
+            name for name, value in requiredState.items() if value is None]
+        if missingState:
+            raise RuntimeError(
+                'Cannot reconstruct structural initialization before the '
+                'preliminary fit has materialized: '
+                + ', '.join(missingState))
+
+        fullPriors = self.mesh.rasterize(self.workingImageShape)
+        numberOfStructures = self.originalAlphas.shape[1]
+        expectedPriorShape = tuple(self.workingImageShape) + (
+            numberOfStructures,)
+        if fullPriors.shape != expectedPriorShape:
+            raise RuntimeError(
+                'Fitted full-prior rasterization has shape '
+                f'{fullPriors.shape}, expected {expectedPriorShape}')
+        if len(self.FreeSurferLabels) != numberOfStructures:
+            raise RuntimeError(
+                'Compression-LUT labels do not align with fitted full priors')
+
+        classFractions = np.asarray(self.preliminaryClassFractions)
+        if classFractions.shape[1] != numberOfStructures:
+            raise RuntimeError(
+                'Preliminary class fractions do not align with fitted full '
+                'priors')
+        if np.any(np.count_nonzero(classFractions, axis=0) != 1):
+            raise RuntimeError(
+                'Every full atlas structure must belong to exactly one '
+                'preliminary class')
+        structureClassNumbers = np.argmax(classFractions, axis=0)
+
+        cheatingMeans = np.asarray(self.cheatingMeans)
+        if cheatingMeans.shape != (classFractions.shape[0],):
+            raise RuntimeError(
+                'Preliminary means do not align with preliminary classes')
+        structureMeans = cheatingMeans[structureClassNumbers]
+        classEvidence = (
+            np.asarray(self.workingImage.data)[..., np.newaxis]
+            == structureMeans)
+        scores = np.where(classEvidence, fullPriors, 0)
+
+        priorMass = np.sum(fullPriors, axis=-1, dtype=np.uint64)
+        validSupport = priorMass > (0.99 * 65535)
+        missingEvidence = validSupport & ~np.any(scores > 0, axis=-1)
+        scores[missingEvidence] = fullPriors[missingEvidence]
+
+        winningStructures = np.argmax(scores, axis=-1)
+        labels = np.asarray(self.FreeSurferLabels)[winningStructures]
+        labels = labels.copy()
+        labels[~validSupport] = 0
+
+        croppedSegmentation = self.workingImage.new(labels)
+        croppedMask = self.workingImage.new(
+            validSupport.astype('uint8'))
+        targetImage = self.inputImages[0]
+        segmentation = croppedSegmentation.resample_like(
+            targetImage, method='nearest')
+        supportMask = croppedMask.resample_like(
+            targetImage, method='nearest')
+        supportMask.data = supportMask.data > 0
+        segmentation.data[~supportMask.data] = 0
+        segmentation.labels = self.labelMapping
+        return segmentation, supportMask
 
     def crop_image_by_atlas(self, image):
         """
@@ -386,8 +826,12 @@ class MeshModelPlus:
         self.workingImage[mask == 0] = 0
 
         # Get the region-specific artificial Gaussian parameters.
+        gaussianLabelGroups = (
+            self.preliminaryLocalizerLabelGroups
+            if self.preliminaryLocalizerLabelGroups is not None
+            else self.sameGaussianParameters)
         self.cheatingMeans, self.cheatingVariances = (
-            self.get_cheating_gaussians(self.sameGaussianParameters))
+            self.get_cheating_gaussians(gaussianLabelGroups))
 
         if self.preliminarySharedGMMParameters is not None:
             self.cheatingMeans = np.asarray(self.cheatingMeans)
@@ -477,9 +921,16 @@ class MeshModelPlus:
                 if maximalDeformation <= maximalDeformationStopCriterion or relativeChange < relativeChangeInCostStopCriterion:
                     break
 
-        # OK, we're done. Let's modify the mesh atlas in such a way that our computed mesh node positions are
-        # assigned to what was originally the mesh warp corresponding to the first training subject
+        # Restore full anatomy while the mesh still occupies its fitted subject
+        # coordinates, then materialize the structural-initialization state.
         self.mesh.alphas = self.originalAlphas 
+        if self.preliminarySharedGMMParameters is not None:
+            (self.structuralInitializationSegmentation,
+             self.structuralInitializationMask) = (
+                self._reconstruct_structural_initialization_state())
+
+        # Assign fitted positions to the first training-subject warp before
+        # returning the collection to native atlas space.
         self.meshCollection.set_positions(self.originalNodePositions, [self.mesh.points])
 
         # Write the resulting atlas mesh to file in native atlas space.
@@ -926,10 +1377,28 @@ class MeshModelPlus:
         raise NotImplementedError('A MeshModel subclass must implement the get_cheating_label_groups() function!')
 
     def get_cheating_gaussians(self, sameGaussianParameters):
+        """Return artificial Gaussians for preliminary segmentation fitting.
+
+        Configured profiles default to the established nonzero minimum label
+        per localizer class and variance 0.01. Region subclasses may override
+        this method when that convention does not represent their model.
         """
-        This function should return a tuple of (means, variances) for the initial segmentation-fitting stage.
-        """
-        raise NotImplementedError('A MeshModel subclass must implement the get_cheating_gaussians() function!')
+        if self.preliminaryLocalizerLabelGroups is None:
+            raise NotImplementedError(
+                'A MeshModel subclass without configured localizer groups '
+                'must implement get_cheating_gaussians()')
+        if any(not labels for labels in sameGaussianParameters):
+            raise ValueError(
+                'Every preliminary Gaussian requires at least one localizer '
+                'label')
+        means = np.asarray([
+            max(1, min(labels)) for labels in sameGaussianParameters
+        ], dtype=float)
+        variances = np.full(
+            len(sameGaussianParameters),
+            0.01,
+            dtype=float)
+        return means, variances
 
     def get_label_groups(self):
         """

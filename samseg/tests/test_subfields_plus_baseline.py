@@ -44,13 +44,23 @@ def test_thalamic_nuclei_plus_preserves_legacy_constructor_state(
         'cheatingMeans',
         'cheatingVariances',
         'gmm',
+        'inputSegmentationSchemaOverride',
         'lastValidFittedGMMState',
+        'modelPolicy',
+        'modelPolicyFileName',
         'optimizationHistory',
         'preliminaryAlphas',
         'preliminaryClassFractions',
         'preliminaryClassNames',
+        'preliminaryLocalizerLabelGroups',
+        'preliminaryLocalizerLookupTableFileName',
+        'preliminaryModelDirectory',
+        'preliminaryModelProfileName',
+        'preliminaryModelProfiles',
         'preliminarySharedGMMParameters',
         'preliminarySharedGMMParametersFileName',
+        'structuralInitializationMask',
+        'structuralInitializationSegmentation',
         'structuralStage',
     }
 
@@ -75,11 +85,21 @@ def test_successor_declares_structural_lifecycle_state(tmp_path, monkeypatch):
 
     assert model.cheatingMeans is None
     assert model.cheatingVariances is None
+    assert model.inputSegmentationSchemaOverride is None
+    assert model.preliminaryModelProfileName is None
+    assert model.preliminaryModelDirectory == model.atlasDir
+    assert set(model.preliminaryModelProfiles) == {'aseg', 'synthseg'}
     assert model.preliminarySharedGMMParametersFileName is None
     assert model.preliminarySharedGMMParameters is None
     assert model.preliminaryClassFractions is None
     assert model.preliminaryClassNames is None
+    assert model.modelPolicyFileName is None
+    assert model.modelPolicy is None
+    assert model.preliminaryLocalizerLookupTableFileName is None
+    assert model.preliminaryLocalizerLabelGroups is None
     assert model.preliminaryAlphas is None
+    assert model.structuralInitializationSegmentation is None
+    assert model.structuralInitializationMask is None
     assert model.structuralStage is None
     assert model.gmm is None
     assert model.bootstrapGMMState is None

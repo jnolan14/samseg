@@ -8,11 +8,48 @@ from samseg.subregions import utils
 from samseg.subregions.core_plus import MeshModelPlus
 
 
+_PRELIMINARY_MODEL_PROFILE_FILES = {
+    'aseg': {
+        'sharedGMMParametersFileName': 'ASEGsharedGMMparameters.txt',
+        'localizerLookupTableFileName': 'ASEGlocalizerLookupTable.txt',
+        'modelPolicyFileName': 'ASEGmodelPolicy.json',
+    },
+    'synthseg': {
+        'sharedGMMParametersFileName': 'SYNTHSEGsharedGMMparameters.txt',
+        'localizerLookupTableFileName': 'SYNTHSEGlocalizerLookupTable.txt',
+        'modelPolicyFileName': None,
+    },
+}
+
+
 class ThalamicNucleiPlus(MeshModelPlus):
 
     def __init__(self, **kwargs):
-        atlasDir = os.path.join(os.environ.get('FREESURFER_HOME'), 'average', 'ThalamicNuclei', 'atlas')
+        atlasDir = kwargs.pop('atlasDir', None)
+        if atlasDir is None:
+            atlasDir = os.path.join(
+                os.environ.get('FREESURFER_HOME'), 'average',
+                'ThalamicNuclei', 'atlas')
+
+        preliminaryModelDirectory = kwargs.pop(
+            'preliminaryModelDirectory', atlasDir)
+        inputSegmentationSchema = kwargs.pop(
+            'inputSegmentationSchema', None)
+
         super().__init__(atlasDir=atlasDir, **kwargs)
+
+        self.preliminaryModelDirectory = preliminaryModelDirectory
+        self.preliminaryModelProfiles = {
+            profileName: {
+                fieldName: (
+                    os.path.join(preliminaryModelDirectory, fileName)
+                    if fileName is not None else None)
+                for fieldName, fileName in profile.items()
+            }
+            for profileName, profile
+            in _PRELIMINARY_MODEL_PROFILE_FILES.items()
+        }
+        self.inputSegmentationSchemaOverride = inputSegmentationSchema
 
         # Model thalamus with two components
         self.useTwoComponents = True
@@ -39,70 +76,33 @@ class ThalamicNucleiPlus(MeshModelPlus):
         Preprocess the input seg and images
         """
 
-        # Define a few hardcoded label constants
+        # Output/postprocessing uses the canonical thalamus segmentation labels.
         self.THlabelLeft = 10
         self.THlabelRight = 49
-        self.DElabelLeft = 28
-        self.DElabelRight = 60
+
+        self._configure_preliminary_model_profile(
+            self.preliminaryModelProfiles,
+            requestedProfileName=self.inputSegmentationSchemaOverride)
+        self._ensure_preliminary_model_state()
 
         # Atlas alignment target is a masked segmentation
-        match_labels = [self.THlabelLeft, self.THlabelRight, self.DElabelLeft, self.DElabelRight]
+        match_labels = self._get_preliminary_affine_support_labels()
         mask = np.isin(self.inputSeg.data, match_labels).astype('float32') * 255
         self.atlasAlignmentTarget = self.inputSeg.new(mask)
 
-        # Now, the idea is to refine the transform based on the thalamus + ventral DE
-        # First, we prepare a modifided SEG that we'll segment
-        data = self.inputSeg.data
-
-        # There's a bunch of labels in the SEG that we don't have in our atlas
-        # So we'll have to get rid of those
-        data[data == 5]  = 4   # left-inf-lat-vent -> left-lat-vent
-        data[data == 44] = 4   # right-inf-lat-vent -> left-lat-vent
-        data[data == 14] = 4   # 3rd vent -> left-lat-vent
-        data[data == 15] = 4   # 4th vent -> LV (we're killing brainstem anyway)
-        data[data == 17] = 3   # left HP -> left cortex
-        data[data == 53] = 3   # right HP -> left cortex
-        data[data == 18] = 3   # left amygdala -> left cortex
-        data[data == 54] = 3   # right amygdala -> left cortex
-        data[data == 24] = 4   # CSF -> left-lat-vent
-        data[data == 30] = 2   # left-vessel -> left WM
-        data[data == 62] = 2   # right-vessel -> left WM
-        data[data == 72] = 4   # 5th ventricle -> left-lat-vent
-        data[data == 77] = 2   # WM hippoint -> left WM
-        data[data == 80] = 0   # non-WM hippo -> background
-        data[data == 85] = 0   # optic chiasm -> background
-        data[data > 250] = 2   # CC labels -> left WM
-
-        # Next we want to remove hemi-specific lables, so we convert right labels to left
-        data[data == 41] = 2   # WM
-        data[data == 42] = 3   # CT
-        data[data == 43] = 4   # LV
-        data[data == 46] = 7   # cerebellum WM
-        data[data == 47] = 8   # cerebellum CT
-        data[data == 50] = 11  # CA
-        data[data == 51] = 12  # PU
-        data[data == 52] = 13  # PA
-        data[data == 58] = 26  # AA
-        data[data == 63] = 31  # CP
-
-        # Remove a few remainders
-        removal_mask = np.isin(data, [44, 62, 63, 41, 42, 43, 50, 51, 52, 53, 54, 58])
-        data[removal_mask] = 0
-
-        # And convert background to 1
-        data[data == 0] = 1
-
-        # Now, create a mask with DE merged into thalamus. This will be the
-        # synthetic image used for initial mesh fitting
-        segMerged = self.inputSeg.copy()
-        segMerged[segMerged == self.DElabelLeft] = self.THlabelLeft
-        segMerged[segMerged == self.DElabelRight] = self.THlabelRight
-        self.synthImage = segMerged
+        # Build the preliminary target without changing the source localizer.
+        # VDC and thalamus intentionally share each hemispheric class because
+        # their coarse-localizer boundary is not trusted for mesh deformation;
+        # fitted full atlas priors reconstruct that distinction afterwards.
+        self.synthImage = self._build_preliminary_synthetic_image(
+            self.inputSeg)
 
         # And also used for image cropping around the thalamus
-        thalamicMask = (segMerged == self.THlabelLeft) | (segMerged == self.THlabelRight)
+        thalamicMask = ((self.synthImage == self.THlabelLeft)
+                        | (self.synthImage == self.THlabelRight))
         fixedMargin = int(np.round(15 / np.mean(self.inputSeg.geom.voxsize)))
-        imageCropping = segMerged.new(thalamicMask).bbox(margin=fixedMargin)
+        imageCropping = self.synthImage.new(thalamicMask).bbox(
+            margin=fixedMargin)
 
         # Lastly, use it to make the image mask
         struct = np.ones((3, 3, 3))
@@ -127,6 +127,28 @@ class ThalamicNucleiPlus(MeshModelPlus):
 
         # Define the pre-processed target image
         self.processedImage = image.new(np.stack(images, axis=-1))
+
+    def _get_preliminary_affine_support_labels(self):
+        """Return localizer labels supporting thalamus affine alignment."""
+        classNumbers = {
+            className: classNumber
+            for classNumber, className
+            in enumerate(self.preliminaryClassNames)
+        }
+        try:
+            thalamusClassNumbers = [
+                classNumbers['LeftThalamus'],
+                classNumbers['RightThalamus'],
+            ]
+        except KeyError as error:
+            raise ValueError(
+                'Thalamus preliminary model requires LeftThalamus and '
+                'RightThalamus classes') from error
+        return sorted({
+            label
+            for classNumber in thalamusClassNumbers
+            for label in self.preliminaryLocalizerLabelGroups[classNumber]
+        })
 
     def postprocess_segmentation(self):
         """
@@ -168,53 +190,6 @@ class ThalamicNucleiPlus(MeshModelPlus):
         # Write the volumes
         self.write_volumes(segFilePrefix + '.volumes.txt')
 
-    def get_cheating_label_groups(self):
-        """
-        Return a group (list of lists) of label names that determine the
-        class reductions for the initial segmentation-fitting stage.
-        """
-        labelGroups = [
-            ['Unknown'],
-            ['Left-Cerebral-White-Matter'],
-            ['Left-Cerebral-Cortex'],
-            ['Left-Cerebellum-Cortex'],
-            ['Left-Cerebellum-White-Matter'],
-            ['Brain-Stem'],
-            ['Left-Lateral-Ventricle'],
-            ['Left-choroid-plexus'],
-            ['Left-Putamen'],
-            ['Left-Pallidum'],
-            ['Left-Accumbens-area'],
-            ['Left-Caudate'],
-        ]
-        thalamicLabels = [
-            'L-Sg', 'LGN', 'MGN', 'PuI', 'PuM', 'H', 'PuL',
-            'VPI', 'PuA', 'R', 'MV(Re)', 'Pf', 'CM', 'LP', 'VLa',
-            'VPL', 'VLp', 'MDm', 'VM', 'CeM', 'MDl', 'Pc', 'MDv', 'Pv',
-            'CL', 'VA', 'VPM', 'AV', 'VAmc', 'Pt', 'AD', 'LD', 'VentralDC'
-        ]
-        labelGroups.append(['Left-' + label for label in thalamicLabels])
-        labelGroups.append(['Right-' + label for label in thalamicLabels])
-        return labelGroups
-
-    def get_cheating_gaussians(self, sameGaussianParameters):
-        """
-        Return a tuple of (means, variances) for the initial segmentation-fitting stage.
-        """
-        means = np.zeros(len(sameGaussianParameters))
-        variances = 0.01 * np.ones(len(sameGaussianParameters))
-        for i in range(len(sameGaussianParameters)):
-            label = sameGaussianParameters[i][0]
-            if label >= 8100 and label < 8200:
-                means[i] = self.THlabelLeft  # left thalamic nuclei + DE -> left TH
-            elif label >= 8200:
-                means[i] = self.THlabelRight  # right thalamic nuclei + DE -> left TH
-            elif label == 0:
-                means[i] = 1  # background is 1 instead of 0
-            else:
-                means[i] = label
-        return (means, variances)
-
     def get_label_groups(self):
         """
         Return a group (list of lists) of label names that determine the class reductions for
@@ -246,9 +221,18 @@ class ThalamicNucleiPlus(MeshModelPlus):
         return labelGroups
 
     def get_gaussian_hyps(self, sameGaussianParameters, mesh):
+        """Estimate structural Gaussian hyperparameters after atlas fitting.
+
+        Masks come from the full-label reconstruction produced by the fitted
+        preliminary mesh, not from source-localizer boundaries that were
+        deliberately collapsed during preliminary deformation.
         """
-        Return a tuple of (meanHyps, nHyps) for Gaussian parameter estimation.
-        """
+        if (self.structuralInitializationSegmentation is None
+                or self.structuralInitializationMask is None):
+            raise RuntimeError(
+                'fit_mesh_to_seg() must reconstruct structural initialization '
+                'before Gaussian hyperparameters are estimated')
+
         nHyper = np.zeros(len(sameGaussianParameters))
         meanHyper = np.zeros(len(sameGaussianParameters))
 
@@ -259,24 +243,15 @@ class ThalamicNucleiPlus(MeshModelPlus):
             
             labels = np.array(sameGaussianParameters[g])
 
-            if any(labels > 8225):  # thalamus
-                listMask = [10, 49]
-            elif any(labels == 28): # VDE
-                listMask = [28, 60]
-            elif any(labels == 0):  # background
-                listMask = [1]
-            else:
-                listMask = labels
-            
-            if len(listMask) > 0:
-                MASK = np.zeros(DATA.shape, dtype='bool')
-                for l in range(len(listMask)):
-                    # Ensure that this uses a modified segmentation
-                    MASK = MASK | (self.inputSeg == listMask[l])
+            if len(labels) > 0:
+                MASK = np.isin(
+                    self.structuralInitializationSegmentation.data,
+                    labels)
+                MASK &= self.structuralInitializationMask.data
                 radius = np.round(1 / np.mean(DATA.geom.voxsize))
                 MASK = scipy.ndimage.morphology.binary_erosion(MASK, utils.spherical_strel(radius), border_value=1)
-                total_mask = MASK & (DATA > 0)
-                data = DATA[total_mask]
+                total_mask = MASK & (DATA.data > 0)
+                data = DATA.data[total_mask]
                 meanHyper[g] = np.median(data)
                 if any(labels == 28):
                     # Special case: VDE is kind of bimodal in FreeSurfer

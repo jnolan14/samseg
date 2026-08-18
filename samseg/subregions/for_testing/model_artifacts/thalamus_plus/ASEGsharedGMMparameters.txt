@@ -1,0 +1,17 @@
+# The format is: mergedName numberOfComponents searchStrings
+
+Unknown 1 Unknown non-WM-hypointensities Optic-Chiasm
+CrbrlWM 1 Cerebral-White-Matter ThalNuc-R Tract vessel CC_
+CrbrlCrtx 1 Cerebral-Cortex Hippocampus Amygdala ctx-lh- ctx-rh-
+CrblmCrtx 1 Cerebellum-Cortex
+CrblmWM 1 Cerebellum-White-Matter
+BrainStem 1 Brain-Stem
+Ventricle 1 Ventricle Lat-Vent CSF
+Chrd 1 choroid-plexus
+Putamen 1 Putamen
+Pallidum 1 Pallidum
+Accmbns 1 Accumbens-area
+Caudate 1 Caudate
+# New ThalNuc-R labels are excluded because reticular nuclei share CrbrlWM.
+LeftThalamus 1 Left-Thalamus Left-VentralDC Left-ThalNuc-A Left-ThalNuc-C Left-ThalNuc-L Left-ThalNuc-M Left-ThalNuc-P Left-ThalNuc-V Left-LGN Left-MGN Left-PuI Left-PuM Left-L-Sg Left-VPL Left-CM Left-VLa Left-PuA Left-MDm Left-Pf Left-VAmc Left-MDl Left-CeM Left-VA Left-MV(Re) Left-R Left-VM Left-CL Left-PuL Left-Pt Left-AV Left-Pc Left-VLp Left-LP Left-LD
+RightThalamus 1 Right-Thalamus Right-VentralDC Right-ThalNuc-A Right-ThalNuc-C Right-ThalNuc-L Right-ThalNuc-M Right-ThalNuc-P Right-ThalNuc-V Right-LGN Right-MGN Right-PuI Right-PuM Right-L-Sg Right-VPL Right-CM Right-VLa Right-PuA Right-MDm Right-Pf Right-VAmc Right-MDl Right-CeM Right-VA Right-MV(Re) Right-R Right-VM Right-CL Right-PuL Right-Pt Right-AV Right-Pc Right-VLp Right-LP Right-LD
