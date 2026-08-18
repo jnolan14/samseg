@@ -169,8 +169,7 @@ def main():
     else:
         print("Assuming an identity transformation between base and each time point")
         for tp in args.timepoint:
-            tpVol = sf.load_volume(tp)
-            tpToBaseTransforms.append(sf.Affine(np.eye(4), source=tpVol.geom, target=tpVol.geom))
+            tpToBaseTransforms.append(sf.Affine(np.eye(4)))
 
 
     # ------ Run Samsegment ------
