@@ -10,7 +10,6 @@ from samseg.io import kvlReadSharedGMMParameters
 from samseg.merge_alphas import kvlGetMergingFractionsTable
 from samseg.subregions.core_plus import MeshModelPlus
 from samseg.subregions.model_policy import SubregionModelPolicy
-from samseg.subregions import thalamus_plus
 from samseg.subregions.thalamus_plus import ThalamicNucleiPlus
 
 
@@ -27,16 +26,19 @@ LOCALIZER_LUT_FILES = {
     'aseg': MODEL_ARTIFACT_DIR / 'ASEGlocalizerLookupTable.txt',
     'synthseg': MODEL_ARTIFACT_DIR / 'SYNTHSEGlocalizerLookupTable.txt',
 }
-POLICY_FILES = {
-    'aseg': MODEL_ARTIFACT_DIR / 'ASEGmodelPolicy.json',
-}
+POLICY_FILE = MODEL_ARTIFACT_DIR / 'modelPolicy.json'
 
+# Captured label-name inventories from the historical structural atlas, the
+# installed DTI atlas, and the mature MATLAB DTI atlas. Shared parameters must
+# assign every listed structure to exactly one preliminary class.
 ATLAS_LUT_VOCABULARIES = (
     TEST_DATA_DIR / 'historical_thalamus_lut_names.txt',
     TEST_DATA_DIR / 'installed_dti_thalamus_lut_names.txt',
     TEST_DATA_DIR / 'matlab_dti_thalamus_lut_names.txt',
 )
 
+# Exact input-label vocabularies declared by the profile-local lookup tables.
+# Keeping them explicit catches unintended expansion from a global LUT.
 ASEG_LABELS = {
     0, 2, 3, 4, 5, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18,
     24, 26, 28, 30, 31, 41, 42, 43, 44, 46, 47, 49, 50, 51,
@@ -52,6 +54,8 @@ SYNTHSEG_PARCELLATION_LABELS = (
     {1001, 1002, 1003, *range(1005, 1036)}
     | {2001, 2002, 2003, *range(2005, 2036)})
 
+# Synthetic output label for each coarse shared-parameter class. These are
+# model-artifact targets, not labels inferred from a particular subject.
 EXPECTED_TARGETS = {
     'aseg': {
         'Unknown': 1,
@@ -116,20 +120,25 @@ def _read_names(path):
 
 def _load_groups(schema):
     parameters = kvlReadSharedGMMParameters(PARAMETER_FILES[schema])
-    policy = (
-        SubregionModelPolicy.read(POLICY_FILES[schema])
-        if schema in POLICY_FILES else SubregionModelPolicy())
+    policy = SubregionModelPolicy.read(POLICY_FILE)
     lookupTable = sf.load_label_lookup(LOCALIZER_LUT_FILES[schema])
     model = object.__new__(MeshModelPlus)
     model.modelPolicy = policy
+    model.modelPolicyFileName = None
+    model.preliminaryModelProfileName = schema
     return parameters, model._build_preliminary_localizer_label_groups(
         parameters, lookupTable)
 
 
 @pytest.mark.parametrize('schema', ['aseg', 'synthseg'])
 @pytest.mark.parametrize('lutFile', ATLAS_LUT_VOCABULARIES)
-def test_universal_preliminary_artifacts_cover_audited_atlas_luts_once(
+def test_preliminary_profiles_define_expected_classes_and_map_each_atlas_label_once(
         schema, lutFile):
+    """Check class order and unique coverage across supported atlas names.
+
+    A failure indicates missing or overlapping shared-parameter search strings,
+    or an unintended change to the preliminary class definitions.
+    """
     parameters = kvlReadSharedGMMParameters(PARAMETER_FILES[schema])
     assert [parameter.mergedName for parameter in parameters] == list(
         EXPECTED_TARGETS[schema])
@@ -143,7 +152,8 @@ def test_universal_preliminary_artifacts_cover_audited_atlas_luts_once(
 
 
 @pytest.mark.parametrize('schema', ['aseg', 'synthseg'])
-def test_new_thalamus_families_use_compact_nonreticular_prefixes(schema):
+def test_thalamus_classes_match_aclmpv_nuclei_but_exclude_reticular_nuclei(
+        schema):
     parameters = kvlReadSharedGMMParameters(PARAMETER_FILES[schema])
     byClass = {
         parameter.mergedName: parameter.searchStrings
@@ -151,6 +161,9 @@ def test_new_thalamus_families_use_compact_nonreticular_prefixes(schema):
     }
 
     for side in ('Left', 'Right'):
+        # A/C/L/M/P/V are the compact prefixes present in the supported DTI
+        # thalamic-nucleus vocabularies. R is reticular and belongs to white
+        # matter.
         familyTokens = {
             f'{side}-ThalNuc-{initial}'
             for initial in 'ACLMPV'
@@ -165,8 +178,12 @@ def test_new_thalamus_families_use_compact_nonreticular_prefixes(schema):
 
 @pytest.mark.parametrize('schema', ['aseg', 'synthseg'])
 @pytest.mark.parametrize('lutFile', ATLAS_LUT_VOCABULARIES[1:])
-def test_new_reticular_labels_remain_exclusively_white_matter(
+def test_reticular_nucleus_labels_map_to_white_matter_not_thalamus(
         schema, lutFile):
+    """Reticular nuclei belong to cerebral white matter in both DTI vocabularies.
+
+    A failure means a reticular label would enter the coarse thalamus class.
+    """
     parameters = kvlReadSharedGMMParameters(PARAMETER_FILES[schema])
     names = _read_names(lutFile)
     with contextlib.redirect_stdout(io.StringIO()):
@@ -193,7 +210,7 @@ def test_new_reticular_labels_remain_exclusively_white_matter(
          SYNTHSEG_BASE_LABELS | SYNTHSEG_PARCELLATION_LABELS),
     ],
 )
-def test_localizer_artifact_is_the_bounded_model_vocabulary(
+def test_localizer_lookup_tables_contain_exact_profile_label_sets(
         schema, expectedLabels):
     lookupTable = sf.load_label_lookup(LOCALIZER_LUT_FILES[schema])
 
@@ -201,7 +218,8 @@ def test_localizer_artifact_is_the_bounded_model_vocabulary(
 
 
 @pytest.mark.parametrize('schema', ['aseg', 'synthseg'])
-def test_localizer_vocabulary_derives_established_targets(schema):
+def test_localizer_groups_partition_profile_labels_and_use_expected_targets(
+        schema):
     parameters, groups = _load_groups(schema)
     classNames = [parameter.mergedName for parameter in parameters]
     allLabels = [label for group in groups for label in group]
@@ -209,22 +227,37 @@ def test_localizer_vocabulary_derives_established_targets(schema):
     assert len(allLabels) == len(set(allLabels))
     assert set(allLabels) == set(
         sf.load_label_lookup(LOCALIZER_LUT_FILES[schema]))
+    # Synthetic recoding uses the minimum class member as its target, except
+    # that an Unknown class containing label 0 is represented by nonzero 1.
     assert [max(1, min(labels)) for labels in groups] == [
         EXPECTED_TARGETS[schema][name] for name in classNames]
 
 
-def test_policy_contains_only_irreducible_exact_memberships():
-    aseg = SubregionModelPolicy.read(POLICY_FILES['aseg'])
+def test_default_thalamus_policy_defines_profile_memberships_and_initialization_values():
+    """Record model-policy values consumed before the first GMM is constructed."""
+    policy = SubregionModelPolicy.read(POLICY_FILE)
 
-    assert aseg.preliminaryLocalizerLabelMemberships == {
+    # Label 77 is ASEG WM-hypointensities; it has no SynthSeg membership.
+    assert policy.get_preliminary_localizer_label_memberships('aseg') == {
         'CrbrlWM': (77,),
     }
-    assert not (MODEL_ARTIFACT_DIR / 'SYNTHSEGmodelPolicy.json').exists()
+    assert policy.get_preliminary_localizer_label_memberships('synthseg') == {}
+    assert policy.affineTargetMorphology == 'opening'
+    assert policy.localizerAnatomicalSupportMarginInMm == 1.5
+    assert policy.preliminaryAtlasDomainInteriorMarginInMm == 3.0
+    assert policy.regionalAtlasDomainInteriorMarginInMm == 2.0
+    assert policy.zeroEvidenceInitialization.strategy == (
+        'subject_non_background_median')
+    # Strength 10 belongs to the zero-evidence subject-median fallback, not the
+    # historical fixed VDC strength.
+    assert policy.zeroEvidenceInitialization.strength == 10.0
 
 
 def test_thalamus_plus_accepts_atlas_override_without_changing_default(
         tmp_path, monkeypatch):
     defaultModel = _model(tmp_path, monkeypatch)
+    # Deliberately separate the mesh-atlas and preliminary-model directories to
+    # show that atlas selection does not redirect the localizer artifacts.
     explicitAtlas = tmp_path / 'selected-atlas'
     selectedModel = _model(
         tmp_path, monkeypatch,
@@ -255,7 +288,7 @@ def test_thalamus_plus_validates_schema_override(tmp_path, monkeypatch):
             requestedProfileName=model.inputSegmentationSchemaOverride)
 
 
-def test_thalamus_profile_selection_configures_atomic_artifact_set(
+def test_thalamus_profile_selection_selects_artifacts_and_shared_policy(
         tmp_path, monkeypatch):
     model = _model(
         tmp_path, monkeypatch,
@@ -273,7 +306,7 @@ def test_thalamus_profile_selection_configures_atomic_artifact_set(
         PARAMETER_FILES['synthseg'])
     assert model.preliminaryLocalizerLookupTableFileName == str(
         LOCALIZER_LUT_FILES['synthseg'])
-    assert model.modelPolicyFileName is None
+    assert model.modelPolicyFileName == str(POLICY_FILE)
 
 
 @pytest.mark.parametrize(
@@ -281,7 +314,6 @@ def test_thalamus_profile_selection_configures_atomic_artifact_set(
     [
         ('ASEGsharedGMMparameters.txt', 'shared-GMM parameter'),
         ('ASEGlocalizerLookupTable.txt', 'localizer lookup table'),
-        ('ASEGmodelPolicy.json', 'model policy'),
     ],
 )
 def test_missing_preliminary_artifact_fails_with_selected_path(
@@ -291,7 +323,7 @@ def test_missing_preliminary_artifact_fails_with_selected_path(
     sources = (
         *PARAMETER_FILES.values(),
         *LOCALIZER_LUT_FILES.values(),
-        *POLICY_FILES.values(),
+        POLICY_FILE,
     )
     for source in sources:
         if source.name != missingName:
@@ -308,20 +340,39 @@ def test_missing_preliminary_artifact_fails_with_selected_path(
             requestedProfileName=model.inputSegmentationSchemaOverride)
 
 
-def test_cross_schema_policy_fails_against_selected_vocabulary():
+def test_missing_model_policy_file_is_reported_when_policy_is_loaded(
+        tmp_path, monkeypatch):
+    modelDirectory = tmp_path / 'model'
+    modelDirectory.mkdir()
+    for source in (*PARAMETER_FILES.values(), *LOCALIZER_LUT_FILES.values()):
+        (modelDirectory / source.name).write_text(source.read_text())
+    model = _model(
+        tmp_path, monkeypatch,
+        preliminaryModelDirectory=str(modelDirectory))
+
+    with pytest.raises(ValueError, match='model policy file does not exist'):
+        model._ensure_model_policy()
+
+
+def test_aseg_only_label_77_is_not_added_to_synthseg_groups():
+    # Label 77 exists only in the ASEG localizer LUT, where policy assigns
+    # WM-hypointensities to the cerebral-white-matter preliminary class.
     parameters = kvlReadSharedGMMParameters(PARAMETER_FILES['synthseg'])
     lookupTable = sf.load_label_lookup(LOCALIZER_LUT_FILES['synthseg'])
-    asegPolicy = SubregionModelPolicy.read(POLICY_FILES['aseg'])
+    policy = SubregionModelPolicy.read(POLICY_FILE)
     model = object.__new__(MeshModelPlus)
-    model.modelPolicy = asegPolicy
+    model.modelPolicy = policy
+    model.modelPolicyFileName = None
+    model.preliminaryModelProfileName = 'synthseg'
 
-    with pytest.raises(ValueError, match='absent.*77'):
-        model._build_preliminary_localizer_label_groups(
-            parameters, lookupTable)
+    groups = model._build_preliminary_localizer_label_groups(
+        parameters, lookupTable)
+
+    assert 77 not in {label for group in groups for label in group}
 
 
 @pytest.mark.parametrize('schema', ['aseg', 'synthseg'])
-def test_generic_builder_uses_fixed_groups_without_mutating_localizer(
+def test_synthetic_preliminary_image_uses_profile_targets_without_changing_input(
         tmp_path, monkeypatch, schema):
     model = _model(tmp_path, monkeypatch)
     parameters, groups = _load_groups(schema)
@@ -329,6 +380,8 @@ def test_generic_builder_uses_fixed_groups_without_mutating_localizer(
     model.preliminaryLocalizerLabelGroups = groups
     monkeypatch.setattr(model, '_ensure_preliminary_model_state', lambda: None)
 
+    # One representative from every configured class makes each recoding
+    # target observable without depending on labels present in a real subject.
     representatives = [min(labels) for labels in groups]
     segmentation = _Segmentation(representatives)
     original = segmentation.data.copy()
@@ -350,18 +403,21 @@ def test_builder_rejects_label_outside_selected_vocabulary(
     model.preliminaryLocalizerLabelGroups = groups
     monkeypatch.setattr(model, '_ensure_preliminary_model_state', lambda: None)
 
+    # Label 136 is deliberately absent from the selected ASEG localizer LUT.
     with pytest.raises(ValueError, match='outside.*136'):
         model._build_preliminary_synthetic_image(
             _Segmentation([0, 2, 136]))
 
 
-def test_cheating_means_do_not_depend_on_subject_observed_labels(
+def test_preliminary_gaussian_means_do_not_depend_on_subject_labels(
         tmp_path, monkeypatch):
     model = _model(tmp_path, monkeypatch)
     _, groups = _load_groups('aseg')
     model.preliminaryLocalizerLabelGroups = groups
 
     completeMeans, _ = model.get_cheating_gaussians(groups)
+    # This subject subset omits most configured classes. Model-defined means
+    # must nevertheless remain available for the complete profile.
     observedSubset = _Segmentation([0, 2, 4, 10, 49])
     monkeypatch.setattr(model, '_ensure_preliminary_model_state', lambda: None)
     model._build_preliminary_synthetic_image(observedSubset)
@@ -373,8 +429,10 @@ def test_cheating_means_do_not_depend_on_subject_observed_labels(
 def test_global_lut_entries_cannot_change_selected_vocabulary_means(
         tmp_path):
     parameters, groups = _load_groups('aseg')
-    policy = SubregionModelPolicy.read(POLICY_FILES['aseg'])
+    policy = SubregionModelPolicy.read(POLICY_FILE)
     extendedLut = tmp_path / 'globalFreeSurferLUT.txt'
+    # Label 1 matches cerebral WM and would lower that class's synthetic target
+    # from 2 to 1, but it is absent from the profile-local LUT.
     extendedLut.write_text(
         LOCALIZER_LUT_FILES['aseg'].read_text()
         + '1 Left-Cerebral-White-Matter 0 0 0 1\n')
@@ -382,6 +440,8 @@ def test_global_lut_entries_cannot_change_selected_vocabulary_means(
     selectedMeans = [max(1, min(labels)) for labels in groups]
     model = object.__new__(MeshModelPlus)
     model.modelPolicy = policy
+    model.modelPolicyFileName = None
+    model.preliminaryModelProfileName = 'aseg'
     globalGroups = model._build_preliminary_localizer_label_groups(
         parameters, sf.load_label_lookup(extendedLut))
 
@@ -391,6 +451,9 @@ def test_global_lut_entries_cannot_change_selected_vocabulary_means(
 
 def test_aparc_aseg_provenance_does_not_expand_aseg_model_vocabulary(
         tmp_path, monkeypatch):
+    # Label 1001 is a cortical parcellation label accepted by the SynthSeg
+    # profile but absent from the ASEG localizer LUT. The filename must not
+    # broaden the selected ASEG profile.
     model = _model(
         tmp_path, monkeypatch,
         preliminaryModelDirectory=str(MODEL_ARTIFACT_DIR),
@@ -403,6 +466,12 @@ def test_aparc_aseg_provenance_does_not_expand_aseg_model_vocabulary(
 
 
 def test_aseg_vocabulary_reproduces_legacy_supported_targets():
+    """Preserve the structural localizer's coarse recoding across label families.
+
+    The assertions sample white-matter, ventricular, cortical, bilateral
+    VDC/thalamus, choroid, and Unknown groups. A failure points to changed
+    shared search-string or policy-membership semantics.
+    """
     parameters, groups = _load_groups('aseg')
     targets = {
         label: EXPECTED_TARGETS['aseg'][parameter.mergedName]
@@ -430,6 +499,8 @@ def test_thalamus_labels_are_inferred_from_shared_search_strings(schema):
         for parameter, labels in zip(parameters, groups)
     }
 
+    # Labels 10/49 are left/right thalamus and 28/60 are left/right VDC; both
+    # pairs belong to the corresponding coarse thalamus class.
     assert memberships['LeftThalamus'] == [10, 28]
     assert memberships['RightThalamus'] == [49, 60]
 
@@ -442,45 +513,46 @@ def test_thalamus_affine_support_is_derived_from_profile_groups(
         parameter.mergedName for parameter in parameters]
     model.preliminaryLocalizerLabelGroups = groups
 
+    # Affine support includes both anatomical label families assigned to the
+    # coarse classes: thalamus 10/49 and VDC 28/60.
     assert model._get_preliminary_affine_support_labels() == [10, 28, 49, 60]
-    assert not hasattr(model, 'DElabelLeft')
-    assert not hasattr(model, 'DElabelRight')
 
 
-def test_thalamus_plus_delegates_static_preliminary_policy_to_base():
-    assert 'get_cheating_label_groups' not in ThalamicNucleiPlus.__dict__
-    assert 'get_cheating_gaussians' not in ThalamicNucleiPlus.__dict__
-    assert '_recode_preliminary_segmentation' not in (
-        ThalamicNucleiPlus.__dict__)
-
-
-def test_thalamus_hyperparameters_use_fitted_atlas_reconstruction(
+def test_default_thalamus_vdc_hyperparameters_use_fitted_whole_field_evidence(
         tmp_path, monkeypatch):
+    """Use fitted whole-field evidence rather than raw localizer labels.
+
+    Raw and fitted labels are deliberately swapped: 20/200 must initialize VDC
+    through fitted label 28, while 100/1000 initialize the [8101, 8201] nucleus
+    class. A failure implicates evidence selection or first-stage statistics.
+    """
     model = _model(tmp_path, monkeypatch)
+    model.modelPolicy = SubregionModelPolicy()
     model.resolution = 1.0
-    model.inputImages = [sf.Volume(np.array(
-        [[[20.0]], [[100.0]]], dtype='float32'))]
+    model.intensityPriorImage = sf.Volume(np.array(
+        [[[[20.0, 200.0]]], [[[100.0, 1000.0]]]], dtype='float32'))
+    model.workingImage = sf.Volume(np.ones(
+        (2, 1, 1, 2), dtype='float32'))
     model.inputSeg = sf.Volume(np.array(
         [[[8101]], [[28]]], dtype='int32'))
-    model.initializationSegmentation = sf.Volume(np.array(
+    model.intensityPriorInitializationSegmentation = sf.Volume(np.array(
         [[[28]], [[8101]]], dtype='int32'))
-    model.initializationMask = sf.Volume(np.ones(
+    model.intensityPriorInitializationMask = sf.Volume(np.ones(
         (2, 1, 1), dtype='bool'))
-    monkeypatch.setattr(
-        thalamus_plus.scipy.ndimage.morphology,
-        'binary_erosion',
-        lambda mask, *args, **kwargs: mask)
 
     means, strengths = model.get_gaussian_hyps(
         [[28, 60], [8101, 8201]], mesh=None)
 
-    np.testing.assert_array_equal(means, [20.0, 100.0])
-    np.testing.assert_array_equal(strengths, [10.0, 11.0])
+    # Labels 28/60 are VDC. Strength 11 comes from its one fitted-support
+    # voxel, rather than the historical fixed strength 10.
+    np.testing.assert_array_equal(
+        means, [[20.0, 200.0], [100.0, 1000.0]])
+    np.testing.assert_array_equal(strengths, [11.0, 11.0])
 
 
 def test_thalamus_hyperparameters_require_post_fit_reconstruction(
         tmp_path, monkeypatch):
     model = _model(tmp_path, monkeypatch)
 
-    with pytest.raises(RuntimeError, match='fit_mesh_to_seg'):
+    with pytest.raises(RuntimeError, match='prepare_for_image_fitting'):
         model.get_gaussian_hyps([[28, 60]], mesh=None)

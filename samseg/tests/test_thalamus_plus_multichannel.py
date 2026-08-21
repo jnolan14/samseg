@@ -5,7 +5,6 @@ import pytest
 import surfa as sf
 
 from samseg.subregions import core_plus
-from samseg.subregions.core_plus import MeshModelPlus
 from samseg.subregions.thalamus_plus import ThalamicNucleiPlus
 
 
@@ -42,6 +41,8 @@ class _MRIConvertRunner:
 
 
 def _configured_model(tmp_path, sourceVolumes):
+    # Values 10, 49, and 8101 are distinct mutation sentinels here; this fixture
+    # does not test their anatomical meanings.
     model = object.__new__(ThalamicNucleiPlus)
     model.tempDir = str(tmp_path)
     model.resolution = 1.0
@@ -81,15 +82,13 @@ def _command_references(commands):
     return [command[command.index('-rl') + 1] for command in commands]
 
 
-def test_intensity_channel_resampling_is_mesh_model_plus_machinery():
-    assert '_resample_and_stack_intensity_channels' in (
-        MeshModelPlus.__dict__)
-    assert '_resample_and_stack_intensity_channels' not in (
-        ThalamicNucleiPlus.__dict__)
-
-
 def test_prior_and_regional_stacks_use_independent_reference_geometries(
         tmp_path, monkeypatch):
+    """Materialize whole-field and regional channels on independent grids.
+
+    Both representations must resample directly from the original channels.
+    Values 11/22 expose channel order, while zeros expose regional masking.
+    """
     model, imageCropping, imageMask = _configured_model(
         tmp_path,
         [
@@ -144,8 +143,10 @@ def test_prior_and_regional_stacks_use_independent_reference_geometries(
     np.testing.assert_array_equal(regionalData[~mask], 0)
 
 
-def test_resampling_preserves_source_and_successor_state(
+def test_intensity_resampling_does_not_modify_source_or_initialization_volumes(
         tmp_path, monkeypatch):
+    # Resampling materializes new representations; it must not alter source,
+    # corrected, localizer, or fitted-initialization volumes.
     model, imageCropping, imageMask = _configured_model(
         tmp_path, [_volume(11, (6, 6, 6))])
     monkeypatch.setattr(core_plus.utils, 'run', _MRIConvertRunner())
@@ -189,68 +190,13 @@ def test_resampling_preserves_source_and_successor_state(
         originalState['initializationMask'])
 
 
-def test_thalamus_preprocessing_requests_full_and_regional_representations(
-        tmp_path, monkeypatch):
-    model, _, _ = _configured_model(
-        tmp_path,
-        [
-            _volume(11, (6, 6, 6)),
-            _volume(22, (12, 12, 12), voxsize=(0.5, 0.5, 0.5)),
-        ])
-    model.preliminaryModelProfiles = {'aseg': {}}
-    model.inputSegmentationSchemaOverride = None
-    model.initializationSegmentation = None
-    model.initializationMask = None
-    monkeypatch.setattr(
-        model, '_configure_preliminary_model_profile',
-        lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        model, '_ensure_preliminary_model_state', lambda: None)
-    monkeypatch.setattr(
-        model, '_get_preliminary_affine_support_labels', lambda: [10, 49])
-    monkeypatch.setattr(
-        model, '_build_preliminary_synthetic_image',
-        lambda inputSeg: inputSeg.copy())
-    requests = []
-
-    def record_request(sourceFileNames, referenceImage, outputPrefix,
-                       mask=None):
-        requests.append(
-            (list(sourceFileNames), referenceImage, outputPrefix, mask))
-        data = np.stack([
-            np.full(referenceImage.shape, channelNumber + 1,
-                    dtype='float32')
-            for channelNumber in range(len(sourceFileNames))
-        ], axis=-1)
-        if mask is not None:
-            data[mask.data == 0] = 0
-        return referenceImage.new(data)
-
-    monkeypatch.setattr(
-        model, '_resample_and_stack_intensity_channels', record_request)
-
-    model.preprocess_images()
-
-    assert len(requests) == 2
-    priorRequest, regionalRequest = requests
-    assert priorRequest[0] == model.inputImageFileNames
-    assert priorRequest[1] is model.intensityPriorReferenceImage
-    assert priorRequest[2] == 'intensityPrior'
-    assert priorRequest[3] is None
-    assert regionalRequest[0] == model.inputImageFileNames
-    assert regionalRequest[2] == 'regionalIntensity'
-    assert regionalRequest[3] is model.longMask
-    _assert_same_geometry(model.intensityPriorImage, priorRequest[1])
-    _assert_same_geometry(model.processedImage, regionalRequest[1])
-    assert model.initializationSegmentation is None
-    assert model.initializationMask is None
-
-
 def test_reference_values_do_not_affect_resampled_channel_values(
         tmp_path, monkeypatch):
     model, _, _ = _configured_model(
         tmp_path, [_volume(11, (6, 6, 6))])
     monkeypatch.setattr(core_plus.utils, 'run', _MRIConvertRunner())
+    # Values 1 and 999 make accidental use of reference voxel data visible.
+    # Only the otherwise identical reference geometry is authoritative.
     firstReference = _volume(1, (4, 4, 4))
     secondReference = _volume(999, (4, 4, 4))
 
@@ -277,11 +223,13 @@ def test_mask_must_already_match_requested_reference(tmp_path):
 
 
 @pytest.mark.parametrize('invalidOutput', ['frames', 'geometry'])
-def test_invalid_resampled_channel_fails_before_stacking(
+def test_resampled_channel_with_extra_frames_or_wrong_geometry_is_rejected(
         tmp_path, monkeypatch, invalidOutput):
     model, _, _ = _configured_model(
         tmp_path, [_volume(11, (6, 6, 6))])
 
+    # Extra frames and a shifted affine emulate malformed external-resampler
+    # output. Every channel must be one 3-D frame on the requested grid.
     def invalidate(output):
         if invalidOutput == 'frames':
             return sf.Volume(

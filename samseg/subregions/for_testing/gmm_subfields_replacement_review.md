@@ -632,6 +632,65 @@ not a stable contract: the JSON path is hardcoded (`thalamusDTI.py:323`),
 future adapter but do not justify moving hooks into GMM or broadening this
 review into hook cleanup.
 
+## Successor intensity-policy intent reconstruction (2026-08-18)
+
+This section distinguishes source evidence from subsequent author clarification.
+It records model intent needed to avoid preserving positional implementation
+details during the Plus migration.
+
+### VentralDC strength
+
+Legacy Python and the original MATLAB assign VentralDC a fixed prior strength of
+10 and describe the class as bimodal. Author clarification establishes the
+underlying compromise: a single Gaussian represented VentralDC poorly, but a
+second component could absorb thalamic signal and destabilize the uncertain
+inferior boundary. The weak fixed prior was therefore compatibility policy, not
+a generic low-support rule. Later model work did not find a useful improvement
+from preserving this special case. Mature Plus should use ordinary
+support-derived strength by default; an explicit legacy comparison policy may
+restore 10 only through the configured `VentralDC` class identity.
+
+### Whole-field support halo
+
+The mature ASEG and SynthSeg merge paths dilate trusted non-background
+localizer anatomy by 1.5 mm while excluding invalid structural intensities and
+soft tissue. Author clarification identifies this as a conservative anatomical
+support halo that tolerates localizer boundary uncertainty. It is not intended
+to compensate for regional fitted-atlas extent or to guarantee that later
+erosion succeeds. The dilation mechanics are generic; 1.5 mm is sparse model
+policy.
+
+### Coarse-to-refined thalamus initialization
+
+The original structural code changes grouping after one coarse deformation
+level, assumes the pooled thalamus is the last source class, appends medial after
+lateral, and initializes the pair at the parent hypermean plus/minus 5 with
+strength 25. The mature joint implementation instead constructs configured
+classes up front and only records a TODO about revisiting the old offset.
+
+The accepted successor interpretation is a legacy-comparison stage-entry
+strategy, not an exact mature-MATLAB behavior:
+
+1. source and target stages are independently defined by shared-parameter
+   artifacts;
+2. parent/child correspondence is derived from common atlas membership, never
+   from class position or a globally invented whole-thalamus name;
+3. generic transfer copies fitted parent current state into each refined child,
+   while target hyperparameters and mixture definitions remain target-owned;
+4. fitted child evidence determines their relative ordering independently in
+   each channel;
+5. the legacy-comparison policy weakly separates the two target child
+   hypermeans around the source parent hypermean;
+6. both child strengths use the configured weak value 25; and
+7. exact support extraction, summary statistics, tie handling, and failure
+   behavior remain to be decided when the transition is implemented.
+
+This strategy does not require `channel 0 == T1`; direction is inferred per
+channel. A contrast-specific expectation would require explicit channel
+semantics that the current pipeline does not carry. Implementation remains
+deferred until configured source/target stages and membership-derived
+correspondence exist.
+
 ## Decision record
 
 ### Established conclusively

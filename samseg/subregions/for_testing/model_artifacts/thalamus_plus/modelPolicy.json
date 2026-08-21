@@ -1,0 +1,15 @@
+{
+  "preliminary_localizer_label_memberships_by_profile": {
+    "aseg": {
+      "CrbrlWM": [77]
+    }
+  },
+  "affine_target_morphology": "opening",
+  "localizer_anatomical_support_margin_mm": 1.5,
+  "preliminary_atlas_domain_interior_margin_mm": 3.0,
+  "regional_atlas_domain_interior_margin_mm": 2.0,
+  "zero_evidence_initialization": {
+    "strategy": "subject_non_background_median",
+    "strength": 10.0
+  }
+}

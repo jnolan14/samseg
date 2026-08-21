@@ -2,10 +2,10 @@ import os
 import shlex
 import shutil
 import tempfile
+import warnings
 import numpy as np
 import surfa as sf
 import scipy.ndimage
-import samseg
 from samseg import gems
 from samseg.io import kvlReadSharedGMMParameters
 from samseg.merge_alphas import kvlGetMergingFractionsTable, kvlMergeAlphas
@@ -15,6 +15,26 @@ from samseg.subregions.model_policy import SubregionModelPolicy
 
 
 class MeshModelPlus:
+
+    """Provide the shared lifecycle for successor subregion models.
+
+    The base owns preliminary-model configuration, multichannel geometry,
+    fitted-state reconstruction, post-preliminary initialization evidence, and
+    ordinary intensity fitting. Region subclasses supply model defaults and
+    anatomical preprocessing, optional regional refinement, label grouping,
+    and output behavior.
+
+    Notes
+    -----
+    The source is arranged in lifecycle order: regional preprocessing, atlas
+    alignment and preliminary fitting, initialization-evidence preparation,
+    regional intensity fitting, and output. Configured intensity-stage
+    transitions remain explicit fail-closed extension seams.
+    """
+
+    # -------------------------------------------------------------------------
+    # Shared lifecycle state
+    # -------------------------------------------------------------------------
 
     def __init__(
         self,
@@ -32,24 +52,7 @@ class MeshModelPlus:
         debug=False,
         preliminarySharedGMMParametersFileName=None,
         ):
-        """
-        MeshModel is a generic base class to facilitate GEMS mesh deformation for given ROIs.
-        To implement a mesh model for a particular set of structures, this class must be subclassed
-        and the following functions MUST be implemented:
-
-        self.preprocess_images()         : Precompute the mask, segmentation, and image volumes
-        self.get_cheating_gaussians()    : Return the artificial preliminary Gaussian parameters
-        self.get_label_groups()          : Return the reduced labels group used to fit the mesh to the image
-        self.get_gaussian_hyps()         : Return the hyperparameters used to estimate the Gaussian parameters during image-fitting
-        self.postprocess_segmentation()  : Update and write the label volumes and discrete segmentation(s)
-
-        Copied region classes that have not yet migrated to shared preliminary
-        parameters must also implement self.get_cheating_label_groups().
-
-        Further information is documented in each function definition.
-
-        This is a framework that was meant to facilitate an (almost perfect) port of the subfield matlab code.
-        """
+        """Initialize shared lifecycle state and region-configurable defaults."""
 
         # Set some paths
         self.outDir = outDir
@@ -87,10 +90,18 @@ class MeshModelPlus:
         self.preliminaryLocalizerLabelGroups = None
         self.preliminaryAlphas = None
 
-        # The fitted preliminary mesh later supplies full-label evidence and
-        # valid support for initializing the ordinary intensity model.
+        # The fitted preliminary mesh supplies full labels on the prior-reference
+        # geometry, with validity restricted to fitted regional support.
         self.initializationSegmentation = None
         self.initializationMask = None
+        # Regional EM consumers use an independently materialized form of that
+        # evidence, not the whole-field hyperparameter label map.
+        self.workingInitializationSegmentation = None
+        self.workingInitializationMask = None
+        # Whole-field hyperparameter consumers use a separate merge of fitted
+        # labels and semantically compatible source-localizer anatomy.
+        self.intensityPriorInitializationSegmentation = None
+        self.intensityPriorInitializationMask = None
         # The first intensity supplies the whole-field prior geometry; the
         # aligned stack is reserved for intensity-prior and hyperparameter use.
         self.intensityPriorReferenceImage = None
@@ -117,12 +128,6 @@ class MeshModelPlus:
         self.longMaxIterations = [[6, 3], [2, 1]]
         self.maxGlobalLongIterations = 2
         self.longMask = None
-
-        # Here are some options that control how to much to dilate masks throughout different
-        # stages. Might be necessary to tune depending on the geometry of the ROI (like brainstem).
-        self.atlasTargetSmoothing = 'forward'
-        self.cheatingAlphaMaskStrel = 3
-        self.alphaMaskStrel = 5
 
     def cleanup(self):
         """
@@ -175,32 +180,31 @@ class MeshModelPlus:
         self.warpedMeshFileName = os.path.join(self.tempDir, 'warpedOriginalMesh.txt')
         self.warpedMeshNoAffineFileName = os.path.join(self.tempDir, 'warpedOriginalMeshNoAffine.txt')
 
-        # The input segmentation remains the immutable source localizer. Derived
-        # preliminary and full-label initialization states are stored separately.
+        # The localizer remains immutable. Intensity sources are assumed to be
+        # anatomically preregistered but may use different sampling grids; each
+        # lifecycle representation is derived independently from these sources.
         self.inputSeg = sf.load_volume(self.inputSegFileName)
         self.inputImages = [sf.load_volume(path) for path in self.inputImageFileNames]
         self.correctedImages = [img.copy() for img in self.inputImages]
         self.intensityPriorReferenceImage = self.inputImages[0]
         self.highResImage = np.mean(self.inputImages[0].geom.voxsize) < 0.99
 
-        # Now we define a set of volume members that must be properly computed during
-        # the `preprocess_images` stage of all MeshModel subclasses. Further documentation below.
+        # Region preprocessing supplies the anatomical targets and stage-specific
+        # intensity representations described by preprocess_images().
         self.preprocess_images()
 
+    # -------------------------------------------------------------------------
+    # Regional preprocessing and shared input geometry
+    # -------------------------------------------------------------------------
+
     def preprocess_images(self):
-        """
-        Preprocess the input images for later processing. This function must be redefined in a subclass,
-        and the following volumes (at the minimum) must be set during this stage:
+        """Construct region-selected targets and intensity representations.
 
-            1. self.atlasAlignmentTarget : A binary tissue mask that acts as the target for the initial
-                                          affine atlas registration.
-            2. self.synthImage : A synthetic image generated from the input segmentation, used for the initial
-                                fitting of the mesh to the subject (the `cheating` step).
-            3. self.processedImage: An independently resampled regional image (or set of images represented
-                                    by each frame) used for the primary EM/image-fitting stage. It is expected
-                                    that this image has been properly resampled to the working target resolution.
-
-        It is expected that these are surfa.Volume objects with proper geometry information.
+        Descendants orchestrate anatomical preprocessing and must provide the
+        affine ``atlasAlignmentTarget``, collapsed preliminary ``synthImage``,
+        whole-field ``intensityPriorImage``, and independently sampled regional
+        ``processedImage``. Generic base primitives handle common geometry and
+        model mechanics without deciding regional crop or support policy.
         """
         raise NotImplementedError('All subclasses of MeshModel must implement the preprocess_images() function!')
 
@@ -272,6 +276,95 @@ class MeshModelPlus:
 
         return referenceImage.new(np.stack(channels, axis=-1))
 
+    # TODO: This duplicates the intended physical-radius behavior of
+    # utils.spherical_strel(), whose current pixel-size handling is not
+    # equivalent for the anisotropic physical spacing required here. Replace
+    # this only after correcting the shared implementation and
+    # compatibility-auditing its existing callers.
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _physical_spherical_structure(image, radiusInMm):
+        """Construct a voxel-grid structuring element for a physical radius."""
+        if radiusInMm < 0:
+            raise ValueError('Physical morphology radius must be nonnegative')
+        voxelSize = np.asarray(image.geom.voxsize, dtype='float64')
+        extents = np.ceil(radiusInMm / voxelSize).astype(int)
+        coordinates = np.ogrid[
+            tuple(slice(-extent, extent + 1) for extent in extents)]
+        squaredDistance = sum(
+            (coordinate * spacing) ** 2
+            for coordinate, spacing in zip(coordinates, voxelSize))
+        return squaredDistance <= radiusInMm ** 2 + 1e-12
+
+    # -------------------------------------------------------------------------
+
+    def _localizer_anatomical_support(self, referenceImage):
+        """Return policy-expanded non-background localizer support on a grid."""
+        if self.preliminaryClassFractions is None:
+            raise RuntimeError(
+                'Preliminary class ownership is required for localizer '
+                'anatomical support')
+        atlasLabels = np.asarray(self.FreeSurferLabels)
+        backgroundStructures = np.flatnonzero(atlasLabels == 0)
+        if len(backgroundStructures) != 1:
+            raise RuntimeError(
+                'Preliminary model must contain exactly one atlas background '
+                'label')
+        backgroundClasses = np.flatnonzero(
+            np.asarray(self.preliminaryClassFractions)[
+                :, backgroundStructures[0]] > 0)
+        if len(backgroundClasses) != 1:
+            raise RuntimeError(
+                'Atlas background must have exactly one preliminary class '
+                'owner')
+        backgroundLabels = self.preliminaryLocalizerLabelGroups[
+            backgroundClasses[0]]
+        localizer = self.inputSeg.resample_like(
+            referenceImage, method='nearest')
+        support = ~np.isin(localizer.data, backgroundLabels)
+
+        marginInMm = (
+            self._ensure_model_policy()
+            .localizerAnatomicalSupportMarginInMm)
+        if marginInMm > 0:
+            support = scipy.ndimage.binary_dilation(
+                support,
+                structure=self._physical_spherical_structure(
+                    referenceImage, marginInMm))
+        return support
+
+    def _apply_atlas_domain_interior_margin(self, support, image, marginInMm):
+        """Apply a physical inward margin to atlas cuboid support."""
+        if marginInMm <= 0:
+            return support
+        return scipy.ndimage.binary_erosion(
+            support,
+            structure=self._physical_spherical_structure(image, marginInMm),
+            border_value=1)
+
+    def _apply_affine_target_morphology(self, support):
+        """Apply the policy-selected one-voxel affine-target morphology."""
+        morphology = self._ensure_model_policy().affineTargetMorphology
+        if morphology == 'none':
+            return support
+
+        structure = utils.spherical_strel(1)
+        if morphology == 'closing':
+            support = scipy.ndimage.binary_dilation(
+                support, structure=structure)
+            return scipy.ndimage.binary_erosion(
+                support, structure=structure, border_value=1)
+
+        support = scipy.ndimage.binary_erosion(
+            support, structure=structure, border_value=1)
+        return scipy.ndimage.binary_dilation(
+            support, structure=structure)
+
+    # -------------------------------------------------------------------------
+    # Shared label and class reduction
+    # -------------------------------------------------------------------------
+
     def label_group_names_to_indices(self, labelNames):
         """
         Clean and convert a group of label names (list of lists) to a grouping of label indices.
@@ -290,7 +383,7 @@ class MeshModelPlus:
             alphas = self.originalAlphas
 
         numberOfReducedLabels = len(sameGaussianParameters)
-        # ATH: are alphas always 32-bit floats?
+        # TODO: Confirm whether GEMS alpha buffers are always float32.
         reducedAlphas = np.zeros((alphas.shape[0], numberOfReducedLabels), dtype='float32')
         reducingLookupTable = np.zeros(alphas.shape[1], dtype='int32')
 
@@ -311,6 +404,171 @@ class MeshModelPlus:
 
         return (reducedAlphas, reducingLookupTable)
 
+    # -------------------------------------------------------------------------
+    # Preliminary-model configuration
+    # -------------------------------------------------------------------------
+
+    def _configure_preliminary_model_profile(
+            self, profiles, requestedProfileName=None):
+        """Select and configure one compatible preliminary model profile.
+
+        Parameters
+        ----------
+        profiles : dict
+            Region-provided mapping from profile names to resolved shared-GMM
+            and localizer-LUT paths.
+        requestedProfileName : str, optional
+            Explicit profile selection. When omitted, canonical input naming
+            and bounded localizer vocabularies are used for inference.
+
+        Returns
+        -------
+        str
+            Selected profile name.
+        """
+        # Validate each profile definition and record its bounded vocabulary.
+        if not isinstance(profiles, dict) or not profiles:
+            raise ValueError(
+                'At least one preliminary model profile is required')
+
+        requiredFields = {
+            'sharedGMMParametersFileName',
+            'localizerLookupTableFileName',
+        }
+        supportedFields = requiredFields
+        normalizedProfiles = {}
+        profileVocabularies = {}
+        for profileName, profile in profiles.items():
+            if not isinstance(profileName, str) or not profileName:
+                raise ValueError(
+                    'Preliminary model profile names must be nonempty strings')
+            if not isinstance(profile, dict):
+                raise ValueError(
+                    f'Preliminary model profile {profileName!r} must be a '
+                    'mapping')
+            missingFields = sorted(requiredFields - set(profile))
+            unsupportedFields = sorted(set(profile) - supportedFields)
+            if missingFields or unsupportedFields:
+                details = []
+                if missingFields:
+                    details.append('missing ' + ', '.join(missingFields))
+                if unsupportedFields:
+                    details.append(
+                        'unsupported ' + ', '.join(unsupportedFields))
+                raise ValueError(
+                    f'Invalid preliminary model profile {profileName!r}: '
+                    + '; '.join(details))
+
+            normalizedProfile = {
+                'sharedGMMParametersFileName':
+                    profile['sharedGMMParametersFileName'],
+                'localizerLookupTableFileName':
+                    profile['localizerLookupTableFileName'],
+            }
+            localizerLookupTableFileName = normalizedProfile[
+                'localizerLookupTableFileName']
+            if not os.path.isfile(localizerLookupTableFileName):
+                raise ValueError(
+                    f'Preliminary model profile {profileName!r} localizer '
+                    'lookup table does not exist: '
+                    f'{localizerLookupTableFileName}')
+            localizerLookupTable = sf.load_label_lookup(
+                localizerLookupTableFileName)
+            normalizedProfiles[profileName] = normalizedProfile
+            profileVocabularies[profileName] = {
+                int(label) for label in localizerLookupTable.keys()}
+
+        # Prefer an explicit selection, then canonical filename provenance.
+        if requestedProfileName is not None:
+            if requestedProfileName not in normalizedProfiles:
+                availableProfiles = ', '.join(sorted(normalizedProfiles))
+                raise ValueError(
+                    f'Unknown preliminary model profile '
+                    f'{requestedProfileName!r}; available profiles: '
+                    f'{availableProfiles}')
+            selectedProfileName = requestedProfileName
+        else:
+            fileName = os.path.basename(self.inputSegFileName).lower()
+            for suffix in ('.nii.gz', '.mgz', '.mgh', '.nii'):
+                if fileName.endswith(suffix):
+                    fileName = fileName[:-len(suffix)]
+                    break
+            provenanceMatches = [
+                profileName for profileName in normalizedProfiles
+                if (fileName == profileName.lower()
+                    or fileName.endswith('+' + profileName.lower()))
+            ]
+            if len(provenanceMatches) > 1:
+                raise ValueError(
+                    'Input segmentation name matches multiple preliminary '
+                    'model profiles')
+            selectedProfileName = (
+                provenanceMatches[0] if provenanceMatches else None)
+
+        # If provenance did not select a profile, use observed-label coverage.
+        if not hasattr(self, 'inputSeg'):
+            raise ValueError(
+                'Input segmentation must be loaded before selecting a '
+                'preliminary model profile')
+        observedLabels = set(
+            np.unique(self.inputSeg.data).astype(int).tolist())
+        if selectedProfileName is None:
+            compatibleProfiles = [
+                profileName
+                for profileName, vocabulary in profileVocabularies.items()
+                if observedLabels <= vocabulary
+            ]
+            if len(compatibleProfiles) == 1:
+                selectedProfileName = compatibleProfiles[0]
+            elif not compatibleProfiles:
+                raise ValueError(
+                    'Input segmentation labels are unsupported by the '
+                    'available preliminary model profiles')
+            else:
+                raise ValueError(
+                    'Unable to distinguish compatible preliminary model '
+                    'profiles; select one explicitly')
+
+        unsupportedLabels = sorted(
+            observedLabels - profileVocabularies[selectedProfileName])
+        if unsupportedLabels:
+            raise ValueError(
+                f'Input segmentation contains labels outside preliminary '
+                f'model profile {selectedProfileName!r}: '
+                + ', '.join(str(label) for label in unsupportedLabels))
+
+        # Validate the selected model artifact before publishing profile state.
+        selectedProfile = normalizedProfiles[selectedProfileName]
+        for fieldName, description in (
+                ('sharedGMMParametersFileName',
+                 'shared-GMM parameter file'),):
+            fileName = selectedProfile[fieldName]
+            if fileName is not None and not os.path.isfile(fileName):
+                raise ValueError(
+                    f'Preliminary model profile {selectedProfileName!r} '
+                    f'{description} does not exist: {fileName}')
+
+        self.preliminaryModelProfileName = selectedProfileName
+        self.preliminarySharedGMMParametersFileName = selectedProfile[
+            'sharedGMMParametersFileName']
+        self.preliminaryLocalizerLookupTableFileName = selectedProfile[
+            'localizerLookupTableFileName']
+        return selectedProfileName
+
+    def _ensure_model_policy(self):
+        """Load the one sparse policy object for the full model lifecycle."""
+        if getattr(self, 'modelPolicy', None) is not None:
+            return self.modelPolicy
+        if getattr(self, 'modelPolicyFileName', None) is None:
+            self.modelPolicy = SubregionModelPolicy()
+            return self.modelPolicy
+        if not os.path.isfile(self.modelPolicyFileName):
+            raise ValueError(
+                'Subregion model policy file does not exist: '
+                f'{self.modelPolicyFileName}')
+        self.modelPolicy = SubregionModelPolicy.read(self.modelPolicyFileName)
+        return self.modelPolicy
+
     def _ensure_preliminary_model_state(self):
         """Materialize the shared preliminary grouping state when possible.
 
@@ -318,8 +576,9 @@ class MeshModelPlus:
         alphas are added later, once ``originalAlphas`` is available. Repeated
         calls only fill missing state.
 
-        The label-list branch temporarily keeps copied region classes runnable
-        until they are migrated to shared-parameter specifications.
+        When no shared-parameter artifact is configured, a region subclass may
+        still supply its preliminary grouping through the inherited label-list
+        extension seam.
         """
         parameterFileName = self.preliminarySharedGMMParametersFileName
         if parameterFileName is None:
@@ -366,12 +625,7 @@ class MeshModelPlus:
 
         if (self.preliminaryLocalizerLabelGroups is None
                 and self.preliminaryLocalizerLookupTableFileName is not None):
-            if self.modelPolicy is None:
-                if self.modelPolicyFileName is None:
-                    self.modelPolicy = SubregionModelPolicy()
-                else:
-                    self.modelPolicy = SubregionModelPolicy.read(
-                        self.modelPolicyFileName)
+            self._ensure_model_policy()
             preliminaryLocalizerLookupTable = sf.load_label_lookup(
                 self.preliminaryLocalizerLookupTableFileName)
             self.preliminaryLocalizerLabelGroups = (
@@ -406,6 +660,7 @@ class MeshModelPlus:
             If policy references are invalid or a vocabulary label cannot be
             assigned to exactly one preliminary class.
         """
+        # Validate shared class identities and sparse policy references.
         classNames = [
             parameter.mergedName for parameter in sharedGMMParameters]
         if not classNames:
@@ -414,8 +669,10 @@ class MeshModelPlus:
         if len(classNames) != len(set(classNames)):
             raise ValueError('Preliminary class names must be unique')
 
+        self._ensure_model_policy()
         policyMemberships = (
-            self.modelPolicy.preliminaryLocalizerLabelMemberships)
+            self.modelPolicy.get_preliminary_localizer_label_memberships(
+                self.preliminaryModelProfileName))
         unknownClasses = sorted(set(policyMemberships) - set(classNames))
         if unknownClasses:
             raise ValueError(
@@ -440,6 +697,8 @@ class MeshModelPlus:
                 'selected localizer vocabulary: '
                 + ', '.join(str(label) for label in missingPolicyLabels))
 
+        # Infer vocabulary ownership from shared-GMM search strings. Policy
+        # memberships may fill only labels that inference leaves unmatched.
         groups = [[] for _ in sharedGMMParameters]
         unmatched = []
         ambiguous = []
@@ -475,6 +734,7 @@ class MeshModelPlus:
                      for classNumber in matchingClasses],
                 ))
 
+        # Report every ownership failure before accepting the aligned groups.
         if inferredPolicyLabels:
             details = ', '.join(
                 f'{label} ({name}: {className})'
@@ -496,6 +756,7 @@ class MeshModelPlus:
                 'Selected localizer vocabulary contains labels assigned to '
                 f'multiple preliminary classes: {details}')
 
+        # Every shared class must be represented in the selected vocabulary.
         emptyClasses = [
             className for className, labels in zip(classNames, groups)
             if not labels
@@ -505,153 +766,6 @@ class MeshModelPlus:
                 'Preliminary classes have no labels in the selected '
                 'localizer vocabulary: ' + ', '.join(emptyClasses))
         return groups
-
-    def _configure_preliminary_model_profile(
-            self, profiles, requestedProfileName=None):
-        """Select and configure one compatible preliminary model profile.
-
-        Parameters
-        ----------
-        profiles : dict
-            Region-provided mapping from profile names to resolved shared-GMM,
-            localizer-LUT, and optional model-policy paths.
-        requestedProfileName : str, optional
-            Explicit profile selection. When omitted, canonical input naming
-            and bounded localizer vocabularies are used for inference.
-
-        Returns
-        -------
-        str
-            Selected profile name.
-        """
-        if not isinstance(profiles, dict) or not profiles:
-            raise ValueError(
-                'At least one preliminary model profile is required')
-
-        requiredFields = {
-            'sharedGMMParametersFileName',
-            'localizerLookupTableFileName',
-        }
-        optionalFields = {'modelPolicyFileName'}
-        supportedFields = requiredFields | optionalFields
-        normalizedProfiles = {}
-        profileVocabularies = {}
-        for profileName, profile in profiles.items():
-            if not isinstance(profileName, str) or not profileName:
-                raise ValueError(
-                    'Preliminary model profile names must be nonempty strings')
-            if not isinstance(profile, dict):
-                raise ValueError(
-                    f'Preliminary model profile {profileName!r} must be a '
-                    'mapping')
-            missingFields = sorted(requiredFields - set(profile))
-            unsupportedFields = sorted(set(profile) - supportedFields)
-            if missingFields or unsupportedFields:
-                details = []
-                if missingFields:
-                    details.append('missing ' + ', '.join(missingFields))
-                if unsupportedFields:
-                    details.append(
-                        'unsupported ' + ', '.join(unsupportedFields))
-                raise ValueError(
-                    f'Invalid preliminary model profile {profileName!r}: '
-                    + '; '.join(details))
-
-            normalizedProfile = {
-                'sharedGMMParametersFileName':
-                    profile['sharedGMMParametersFileName'],
-                'localizerLookupTableFileName':
-                    profile['localizerLookupTableFileName'],
-                'modelPolicyFileName': profile.get('modelPolicyFileName'),
-            }
-            localizerLookupTableFileName = normalizedProfile[
-                'localizerLookupTableFileName']
-            if not os.path.isfile(localizerLookupTableFileName):
-                raise ValueError(
-                    f'Preliminary model profile {profileName!r} localizer '
-                    'lookup table does not exist: '
-                    f'{localizerLookupTableFileName}')
-            localizerLookupTable = sf.load_label_lookup(
-                localizerLookupTableFileName)
-            normalizedProfiles[profileName] = normalizedProfile
-            profileVocabularies[profileName] = {
-                int(label) for label in localizerLookupTable.keys()}
-
-        if requestedProfileName is not None:
-            if requestedProfileName not in normalizedProfiles:
-                availableProfiles = ', '.join(sorted(normalizedProfiles))
-                raise ValueError(
-                    f'Unknown preliminary model profile '
-                    f'{requestedProfileName!r}; available profiles: '
-                    f'{availableProfiles}')
-            selectedProfileName = requestedProfileName
-        else:
-            fileName = os.path.basename(self.inputSegFileName).lower()
-            for suffix in ('.nii.gz', '.mgz', '.mgh', '.nii'):
-                if fileName.endswith(suffix):
-                    fileName = fileName[:-len(suffix)]
-                    break
-            provenanceMatches = [
-                profileName for profileName in normalizedProfiles
-                if (fileName == profileName.lower()
-                    or fileName.endswith('+' + profileName.lower()))
-            ]
-            if len(provenanceMatches) > 1:
-                raise ValueError(
-                    'Input segmentation name matches multiple preliminary '
-                    'model profiles')
-            selectedProfileName = (
-                provenanceMatches[0] if provenanceMatches else None)
-
-        if not hasattr(self, 'inputSeg'):
-            raise ValueError(
-                'Input segmentation must be loaded before selecting a '
-                'preliminary model profile')
-        observedLabels = set(
-            np.unique(self.inputSeg.data).astype(int).tolist())
-        if selectedProfileName is None:
-            compatibleProfiles = [
-                profileName
-                for profileName, vocabulary in profileVocabularies.items()
-                if observedLabels <= vocabulary
-            ]
-            if len(compatibleProfiles) == 1:
-                selectedProfileName = compatibleProfiles[0]
-            elif not compatibleProfiles:
-                raise ValueError(
-                    'Input segmentation labels are unsupported by the '
-                    'available preliminary model profiles')
-            else:
-                raise ValueError(
-                    'Unable to distinguish compatible preliminary model '
-                    'profiles; select one explicitly')
-
-        unsupportedLabels = sorted(
-            observedLabels - profileVocabularies[selectedProfileName])
-        if unsupportedLabels:
-            raise ValueError(
-                f'Input segmentation contains labels outside preliminary '
-                f'model profile {selectedProfileName!r}: '
-                + ', '.join(str(label) for label in unsupportedLabels))
-
-        selectedProfile = normalizedProfiles[selectedProfileName]
-        for fieldName, description in (
-                ('sharedGMMParametersFileName',
-                 'shared-GMM parameter file'),
-                ('modelPolicyFileName', 'model policy file')):
-            fileName = selectedProfile[fieldName]
-            if fileName is not None and not os.path.isfile(fileName):
-                raise ValueError(
-                    f'Preliminary model profile {selectedProfileName!r} '
-                    f'{description} does not exist: {fileName}')
-
-        self.preliminaryModelProfileName = selectedProfileName
-        self.preliminarySharedGMMParametersFileName = selectedProfile[
-            'sharedGMMParametersFileName']
-        self.preliminaryLocalizerLookupTableFileName = selectedProfile[
-            'localizerLookupTableFileName']
-        self.modelPolicyFileName = selectedProfile['modelPolicyFileName']
-        return selectedProfileName
 
     def _build_preliminary_synthetic_image(self, segmentation):
         """Construct the artificial segmentation used for preliminary fitting.
@@ -705,99 +819,9 @@ class MeshModelPlus:
             target[source == label] = means[classNumber]
         return segmentation.new(target)
 
-    def _reconstruct_initialization_state(self):
-        """Reconstruct full atlas labels after preliminary mesh fitting.
-
-        The preliminary target deliberately suppresses anatomical distinctions
-        that the coarse localizer cannot support reliably. This method restores
-        full labels from the subject-fitted atlas priors while retaining only
-        the coarse class evidence used for that fit. Optional region-specific
-        refinements, such as SynthSeg choroid handling, operate on the resulting
-        state later.
-
-        Returns
-        -------
-        tuple of surfa.Volume
-            Full-label initialization segmentation and its valid fitted-atlas
-            support mask, both in the first intensity image grid. This state
-            initializes the subsequent ordinary intensity model.
-
-        Raises
-        ------
-        RuntimeError
-            If the configured preliminary model or fitted mesh state is
-            incomplete.
-        """
-        requiredState = {
-            'mesh': getattr(self, 'mesh', None),
-            'workingImage': getattr(self, 'workingImage', None),
-            'originalAlphas': getattr(self, 'originalAlphas', None),
-            'preliminaryClassFractions': self.preliminaryClassFractions,
-            'cheatingMeans': self.cheatingMeans,
-        }
-        missingState = [
-            name for name, value in requiredState.items() if value is None]
-        if missingState:
-            raise RuntimeError(
-                'Cannot reconstruct initialization state before the '
-                'preliminary fit has materialized: '
-                + ', '.join(missingState))
-
-        fullPriors = self.mesh.rasterize(self.workingImageShape)
-        numberOfStructures = self.originalAlphas.shape[1]
-        expectedPriorShape = tuple(self.workingImageShape) + (
-            numberOfStructures,)
-        if fullPriors.shape != expectedPriorShape:
-            raise RuntimeError(
-                'Fitted full-prior rasterization has shape '
-                f'{fullPriors.shape}, expected {expectedPriorShape}')
-        if len(self.FreeSurferLabels) != numberOfStructures:
-            raise RuntimeError(
-                'Compression-LUT labels do not align with fitted full priors')
-
-        classFractions = np.asarray(self.preliminaryClassFractions)
-        if classFractions.shape[1] != numberOfStructures:
-            raise RuntimeError(
-                'Preliminary class fractions do not align with fitted full '
-                'priors')
-        if np.any(np.count_nonzero(classFractions, axis=0) != 1):
-            raise RuntimeError(
-                'Every full atlas structure must belong to exactly one '
-                'preliminary class')
-        structureClassNumbers = np.argmax(classFractions, axis=0)
-
-        cheatingMeans = np.asarray(self.cheatingMeans)
-        if cheatingMeans.shape != (classFractions.shape[0],):
-            raise RuntimeError(
-                'Preliminary means do not align with preliminary classes')
-        structureMeans = cheatingMeans[structureClassNumbers]
-        classEvidence = (
-            np.asarray(self.workingImage.data)[..., np.newaxis]
-            == structureMeans)
-        scores = np.where(classEvidence, fullPriors, 0)
-
-        priorMass = np.sum(fullPriors, axis=-1, dtype=np.uint64)
-        validSupport = priorMass > (0.99 * 65535)
-        missingEvidence = validSupport & ~np.any(scores > 0, axis=-1)
-        scores[missingEvidence] = fullPriors[missingEvidence]
-
-        winningStructures = np.argmax(scores, axis=-1)
-        labels = np.asarray(self.FreeSurferLabels)[winningStructures]
-        labels = labels.copy()
-        labels[~validSupport] = 0
-
-        croppedSegmentation = self.workingImage.new(labels)
-        croppedMask = self.workingImage.new(
-            validSupport.astype('uint8'))
-        targetImage = self.inputImages[0]
-        segmentation = croppedSegmentation.resample_like(
-            targetImage, method='nearest')
-        supportMask = croppedMask.resample_like(
-            targetImage, method='nearest')
-        supportMask.data = supportMask.data > 0
-        segmentation.data[~supportMask.data] = 0
-        segmentation.labels = self.labelMapping
-        return segmentation, supportMask
+    # -------------------------------------------------------------------------
+    # Atlas alignment and preliminary fitting
+    # -------------------------------------------------------------------------
 
     def crop_image_by_atlas(self, image):
         """
@@ -841,17 +865,8 @@ class MeshModelPlus:
         # Crop mask to the label bounding box
         mask = mask.crop_to_bbox(margin=6)
 
-        # Let's smooth the mask a bit (maybe) with one dilation and erosion pass
-        if self.atlasTargetSmoothing == 'forward':
-            strel = utils.spherical_strel(1)
-            mask.data = scipy.ndimage.morphology.binary_dilation(mask.data, strel)
-            mask.data = scipy.ndimage.morphology.binary_erosion(mask.data, strel, border_value=1)
-        elif self.atlasTargetSmoothing == 'backward':
-            strel = utils.spherical_strel(1)
-            mask.data = scipy.ndimage.morphology.binary_erosion(mask.data, strel, border_value=1)
-            mask.data = scipy.ndimage.morphology.binary_dilation(mask.data, strel)
-        elif self.atlasTargetSmoothing is not None:
-            sf.system.fatal(f'Unknown atlasTargetSmoothing option `{self.atlasTargetSmoothing}`.')
+        # Apply the policy-selected morphology to the affine target.
+        mask.data = self._apply_affine_target_morphology(mask.data)
 
         # We're going to use mri_robust_register for this registration, so let's ensure the mask
         # value is 255 and we'll write to disk
@@ -861,8 +876,8 @@ class MeshModelPlus:
 
         # Write the atlas as well
         alignedAtlasFile = os.path.join(self.tempDir, 'alignedAtlasImage.mgz')
-        # ATH skipping this for now... we'll just copy instead
-        # self.atlasImage.save(alignedAtlasFile)
+        # Copying the atlas dump preserves the current registration input; an
+        # equivalent in-memory write has not been established.
         shutil.copyfile(self.atlasDumpFileName, alignedAtlasFile)
 
         # Run the actual registration and load the result
@@ -898,8 +913,11 @@ class MeshModelPlus:
         self._ensure_preliminary_model_state()
         self.mesh.alphas = self.preliminaryAlphas
         mask = (self.mesh.rasterize(self.workingImageShape).sum(-1) / 65535) > 0.99
-        if self.cheatingAlphaMaskStrel > 0:
-            mask = scipy.ndimage.morphology.binary_erosion(mask, utils.spherical_strel(self.cheatingAlphaMaskStrel), border_value=1)
+        mask = self._apply_atlas_domain_interior_margin(
+            mask,
+            self.workingImage,
+            self._ensure_model_policy()
+            .preliminaryAtlasDomainInteriorMarginInMm)
         self.workingImage[mask == 0] = 0
 
         # Get the region-specific artificial Gaussian parameters.
@@ -920,16 +938,16 @@ class MeshModelPlus:
                     'Preliminary means and variances must contain one scalar '
                     'per shared-GMM class')
 
-        # Write the inital and cropped/masked images for debugging purposes
+        # Write the initial and cropped/masked images for debugging.
         if self.debug:
             self.synthImage.save(os.path.join(self.tempDir, 'synthImage.mgz'))
             self.workingImage.save(os.path.join(self.tempDir, 'synthImageMasked.mgz'))
 
     def fit_mesh_to_seg(self):
-        """
-        The second processing step involves deforming the roughly-aligned mesh to the subject segmentation.
-        This is the initial 'cheating' step and requires that the synthImage volume has been properly configured
-        during preprocessing.
+        """Fit the coarse preliminary mesh to the collapsed localizer target.
+
+        The fitted mesh is restored to full anatomical alphas before full-label
+        initialization evidence is reconstructed on the intensity-prior grid.
         """
 
         # Just get the image buffer (array) and convert to a Kvl image object
@@ -942,7 +960,7 @@ class MeshModelPlus:
             # Set mesh alphas
             self.mesh.alphas = self.preliminaryAlphas
 
-            # It's good to smooth the mesh, otherwise we get weird compressions of the mesh along the boundaries
+            # Smooth the mesh to limit boundary compression during deformation.
             if meshSmoothingSigma > 0:
                 print(f'Smoothing mesh collection with kernel size {meshSmoothingSigma}')
                 self.meshCollection.smooth(meshSmoothingSigma)
@@ -1000,7 +1018,7 @@ class MeshModelPlus:
 
         # Restore full anatomy while the mesh still occupies its fitted subject
         # coordinates, then materialize ordinary-model initialization evidence.
-        self.mesh.alphas = self.originalAlphas 
+        self.mesh.alphas = self.originalAlphas
         if self.preliminarySharedGMMParameters is not None:
             (self.initializationSegmentation,
              self.initializationMask) = self._reconstruct_initialization_state()
@@ -1009,16 +1027,502 @@ class MeshModelPlus:
         # returning the collection to native atlas space.
         self.meshCollection.set_positions(self.originalNodePositions, [self.mesh.points])
 
-        # Write the resulting atlas mesh to file in native atlas space.
-        # This is nice because all we need to do is to modify imageDump_coregistered
-        # with the T1-to-T2 transform to have the warped mesh in T2 space
+        # Return the fitted collection to native atlas space for later reuse.
         inverseTransform = gems.KvlTransform(np.asfortranarray(np.linalg.inv(self.transform.as_numpy_array)))
         self.meshCollection.transform(inverseTransform)
         self.meshCollection.write(self.warpedMeshFileName)
 
-    def prepare_for_image_fitting(self, compute_hyps=True):
+    def _reconstruct_initialization_state(self):
+        """Reconstruct full atlas labels after preliminary mesh fitting.
+
+        The preliminary target deliberately suppresses anatomical distinctions
+        that the coarse localizer cannot support reliably. This method restores
+        full labels from the subject-fitted atlas priors while retaining only
+        the coarse class evidence used for that fit. Optional region-specific
+        refinements, such as SynthSeg choroid handling, operate on the resulting
+        state later.
+
+        Returns
+        -------
+        tuple of surfa.Volume
+            Full-label initialization segmentation and its valid fitted-atlas
+            support mask, both on the intensity-prior reference geometry. This
+            state initializes the subsequent ordinary intensity model.
+
+        Raises
+        ------
+        RuntimeError
+            If the configured preliminary model or fitted mesh state is
+            incomplete.
         """
-        Prepare the mesh collection, preprocessed image, reduced alphas, and estimated hyperparameters.
+        # Validate the fitted mesh, coarse-class mapping, and target geometry.
+        requiredState = {
+            'mesh': getattr(self, 'mesh', None),
+            'workingImage': getattr(self, 'workingImage', None),
+            'originalAlphas': getattr(self, 'originalAlphas', None),
+            'preliminaryClassFractions': self.preliminaryClassFractions,
+            'cheatingMeans': self.cheatingMeans,
+        }
+        missingState = [
+            name for name, value in requiredState.items() if value is None]
+        if missingState:
+            raise RuntimeError(
+                'Cannot reconstruct initialization state before the '
+                'preliminary fit has materialized: '
+                + ', '.join(missingState))
+
+        fullPriors = self.mesh.rasterize(self.workingImageShape)
+        numberOfStructures = self.originalAlphas.shape[1]
+        expectedPriorShape = tuple(self.workingImageShape) + (
+            numberOfStructures,)
+        if fullPriors.shape != expectedPriorShape:
+            raise RuntimeError(
+                'Fitted full-prior rasterization has shape '
+                f'{fullPriors.shape}, expected {expectedPriorShape}')
+        if len(self.FreeSurferLabels) != numberOfStructures:
+            raise RuntimeError(
+                'Compression-LUT labels do not align with fitted full priors')
+
+        classFractions = np.asarray(self.preliminaryClassFractions)
+        if classFractions.shape[1] != numberOfStructures:
+            raise RuntimeError(
+                'Preliminary class fractions do not align with fitted full '
+                'priors')
+        if np.any(np.count_nonzero(classFractions, axis=0) != 1):
+            raise RuntimeError(
+                'Every full atlas structure must belong to exactly one '
+                'preliminary class')
+        structureClassNumbers = np.argmax(classFractions, axis=0)
+
+        # Score only structures compatible with the observed coarse class.
+        cheatingMeans = np.asarray(self.cheatingMeans)
+        if cheatingMeans.shape != (classFractions.shape[0],):
+            raise RuntimeError(
+                'Preliminary means do not align with preliminary classes')
+        structureMeans = cheatingMeans[structureClassNumbers]
+        classEvidence = (
+            np.asarray(self.workingImage.data)[..., np.newaxis]
+            == structureMeans)
+        scores = np.where(classEvidence, fullPriors, 0)
+
+        # Fall back to the fitted full priors where quantized coarse evidence is
+        # absent, but only inside the fitted atlas domain.
+        priorMass = np.sum(fullPriors, axis=-1, dtype=np.uint64)
+        validSupport = priorMass > (0.99 * 65535)
+        missingEvidence = validSupport & ~np.any(scores > 0, axis=-1)
+        scores[missingEvidence] = fullPriors[missingEvidence]
+
+        winningStructures = np.argmax(scores, axis=-1)
+        labels = np.asarray(self.FreeSurferLabels)[winningStructures]
+        labels = labels.copy()
+        labels[~validSupport] = 0
+
+        # Project the fitted labels and support onto the prior-reference grid.
+        croppedSegmentation = self.workingImage.new(labels)
+        croppedMask = self.workingImage.new(
+            validSupport.astype('uint8'))
+        targetImage = self.inputImages[0]
+        segmentation = croppedSegmentation.resample_like(
+            targetImage, method='nearest')
+        supportMask = croppedMask.resample_like(
+            targetImage, method='nearest')
+        supportMask.data = supportMask.data > 0
+        segmentation.data[~supportMask.data] = 0
+        segmentation.labels = self.labelMapping
+        return segmentation, supportMask
+
+    # -------------------------------------------------------------------------
+    # Post-preliminary initialization evidence
+    # -------------------------------------------------------------------------
+
+    def _prepare_intensity_initialization_evidence(self, fullPriors):
+        """Complete the post-preliminary evidence lifecycle for intensities.
+
+        Regional fitted evidence is materialized first so a region may refine
+        it. Supported corrections are then projected back before the distinct
+        whole-field state used for intensity hyperparameters is constructed.
+        """
+        self._materialize_working_initialization_state()
+        refinedInitialization = self._refine_initialization_state(fullPriors)
+        fittedSegmentation, fittedMask = (
+            self._apply_working_initialization_refinement(
+                refinedInitialization))
+        return self._materialize_intensity_prior_initialization_state(
+            fittedSegmentation, fittedMask)
+
+    def _materialize_working_initialization_state(self):
+        """Materialize fitted initialization evidence on the regional EM grid.
+
+        ``initializationSegmentation`` remains the fitted-prior reconstruction
+        on the intensity-prior geometry. This method creates the distinct
+        regional form consumed by ordinary image fitting and restricts it to
+        both fitted-atlas support and the regional intensity mask.
+
+        Returns
+        -------
+        tuple of surfa.Volume
+            Regional full-label initialization segmentation and support mask.
+        """
+        if (self.initializationSegmentation is None
+                or self.initializationMask is None):
+            raise RuntimeError(
+                'Preliminary fitting must reconstruct initialization state '
+                'before regional initialization is materialized')
+
+        segmentation = self.initializationSegmentation.resample_like(
+            self.workingImage, method='nearest')
+        fittedSupport = self.initializationMask.resample_like(
+            self.workingImage, method='nearest').data > 0
+        support = fittedSupport & (self.workingMask.data > 0)
+        segmentation.data[~support] = 0
+        segmentation.labels = self.labelMapping
+        supportMask = self.workingImage.new(support.astype('uint8'))
+
+        self.workingInitializationSegmentation = segmentation
+        self.workingInitializationMask = supportMask
+        return segmentation, supportMask
+
+    def _refine_initialization_state(self, fullPriors):
+        """Optionally refine regional initialization labels before statistics.
+
+        The base intensity lifecycle has no anatomical correction to apply.
+        Region descendants may return a corrected regional segmentation while
+        preserving the established support; returning ``None`` is a no-op.
+
+        Parameters
+        ----------
+        fullPriors : numpy.ndarray
+            Full fitted-atlas priors rasterized on the regional EM grid.
+
+        Returns
+        -------
+        surfa.Volume or None
+            Corrected regional initialization labels, or ``None``.
+        """
+        return None
+
+    def _apply_working_initialization_refinement(self, refinedSegmentation):
+        """Project an optional regional correction back to fitted evidence.
+
+        Only labels deliberately changed inside fitted regional support are
+        projected. The no-op path returns the original prior-grid state without
+        a resampling round trip.
+
+        Parameters
+        ----------
+        refinedSegmentation : surfa.Volume or None
+            Optional corrected labels on the regional EM grid.
+
+        Returns
+        -------
+        tuple of surfa.Volume
+            Effective fitted segmentation and support on the prior geometry.
+
+        Raises
+        ------
+        ValueError
+            If a correction has the wrong geometry or changes labels outside
+            fitted regional support.
+        """
+        if refinedSegmentation is None:
+            return self.initializationSegmentation, self.initializationMask
+        if not sf.transform.image_geometry_equal(
+                refinedSegmentation, self.workingImage, tol=1e-5):
+            raise ValueError(
+                'Refined initialization segmentation must match the regional '
+                'EM geometry')
+
+        original = np.asarray(self.workingInitializationSegmentation.data)
+        refined = np.asarray(refinedSegmentation.data)
+        if refined.shape != original.shape:
+            raise ValueError(
+                'Refined initialization segmentation must be three-dimensional')
+        changed = refined != original
+        regionalSupport = self.workingInitializationMask.data > 0
+        if np.any(changed & ~regionalSupport):
+            raise ValueError(
+                'Initialization refinement cannot change labels outside fitted '
+                'regional support')
+        if not np.any(changed):
+            return self.initializationSegmentation, self.initializationMask
+
+        changedVolume = self.workingImage.new(changed.astype('uint8'))
+        changedOnPriorGrid = changedVolume.resample_like(
+            self.initializationSegmentation, method='nearest').data > 0
+        labelsOnPriorGrid = refinedSegmentation.resample_like(
+            self.initializationSegmentation, method='nearest').data
+        fittedSupport = self.initializationMask.data > 0
+        changedOnPriorGrid &= fittedSupport
+
+        effectiveSegmentation = self.initializationSegmentation.copy()
+        effectiveSegmentation.data[changedOnPriorGrid] = (
+            labelsOnPriorGrid[changedOnPriorGrid])
+        effectiveSegmentation.labels = self.labelMapping
+        return effectiveSegmentation, self.initializationMask
+
+    def _materialize_intensity_prior_initialization_state(
+            self, fittedSegmentation, fittedMask):
+        """Build whole-field labels and support for intensity hyperparameters.
+
+        The fitted reconstruction is regional evidence, whereas intensity
+        statistics can require anatomy across the complete prior-reference
+        field. Outside fitted support, immutable source-localizer labels are
+        retained only when their preliminary-class ownership agrees in the
+        independent localizer and atlas namespaces; otherwise the deliberately
+        collapsed preliminary target supplies the class-compatible fallback.
+
+        Parameters
+        ----------
+        fittedSegmentation : surfa.Volume
+            Effective fitted full-label evidence on the prior geometry.
+        fittedMask : surfa.Volume
+            Support of ``fittedSegmentation``.
+
+        Returns
+        -------
+        tuple of surfa.Volume
+            Whole-field initialization labels and statistical support on the
+            intensity-prior reference geometry.
+        """
+        # Validate the three source representations and their common geometry.
+        requiredState = {
+            'intensityPriorImage': self.intensityPriorImage,
+            'inputSeg': self.inputSeg,
+            'synthImage': self.synthImage,
+            'preliminaryClassFractions': self.preliminaryClassFractions,
+            'preliminaryLocalizerLabelGroups': (
+                self.preliminaryLocalizerLabelGroups),
+            'cheatingMeans': self.cheatingMeans,
+        }
+        missing = [
+            name for name, value in requiredState.items() if value is None]
+        if missing:
+            raise RuntimeError(
+                'Cannot build intensity-prior initialization state before: '
+                + ', '.join(missing))
+        for name, volume in (
+                ('fitted segmentation', fittedSegmentation),
+                ('fitted mask', fittedMask)):
+            if not sf.transform.image_geometry_equal(
+                    volume, self.intensityPriorImage, tol=1e-5):
+                raise RuntimeError(
+                    f'{name.capitalize()} must match the intensity-prior '
+                    'geometry')
+
+        # Materialize immutable localizer and collapsed-class evidence on the
+        # whole-field intensity-prior grid.
+        source = self.inputSeg.resample_like(
+            self.intensityPriorImage, method='nearest')
+        collapsed = self.synthImage.resample_like(
+            self.intensityPriorImage, method='nearest')
+        sourceLabels = np.asarray(source.data).astype(int, copy=False)
+        collapsedLabels = np.asarray(collapsed.data).astype(int, copy=True)
+
+        # Retain source labels only when the atlas and localizer namespaces give
+        # them the same preliminary-class owner.
+        atlasOwners, localizerOwners = self._preliminary_class_ownership()
+        compatibleSource = np.zeros(sourceLabels.shape, dtype=bool)
+        for label in np.unique(sourceLabels):
+            atlasOwner = atlasOwners.get(int(label))
+            localizerOwner = localizerOwners.get(int(label))
+            if atlasOwner is not None and atlasOwner == localizerOwner:
+                compatibleSource[sourceLabels == label] = True
+
+        atlasLabels = np.asarray(self.FreeSurferLabels)
+        backgroundStructures = np.flatnonzero(atlasLabels == 0)
+        if len(backgroundStructures) != 1:
+            raise RuntimeError(
+                'Preliminary model must contain exactly one atlas background '
+                'label')
+        backgroundClass = np.flatnonzero(
+            np.asarray(self.preliminaryClassFractions)[
+                :, backgroundStructures[0]] > 0)
+        if len(backgroundClass) != 1:
+            raise RuntimeError(
+                'Atlas background must have exactly one preliminary class '
+                'owner')
+        backgroundValue = np.asarray(self.cheatingMeans)[backgroundClass[0]]
+        collapsedLabels[collapsedLabels == backgroundValue] = 0
+
+        # Fitted reconstruction has highest precedence inside fitted support.
+        merged = collapsedLabels
+        merged[compatibleSource] = sourceLabels[compatibleSource]
+        fittedSupport = fittedMask.data > 0
+        merged[fittedSupport] = fittedSegmentation.data[fittedSupport]
+
+        # Statistical support combines complete multichannel observations with
+        # policy-expanded non-background localizer anatomy.
+        intensityData = np.asarray(self.intensityPriorImage.framed_data)
+        completeCase = np.all(
+            np.isfinite(intensityData) & (intensityData != 0), axis=-1)
+        anatomicalSupport = self._localizer_anatomical_support(
+            self.intensityPriorImage)
+        support = completeCase & anatomicalSupport
+
+        segmentation = self.intensityPriorImage.new(
+            merged.astype('int32', copy=False))
+        segmentation.labels = self.labelMapping
+        supportMask = self.intensityPriorImage.new(
+            support.astype('uint8'))
+        self.intensityPriorInitializationSegmentation = segmentation
+        self.intensityPriorInitializationMask = supportMask
+        return segmentation, supportMask
+
+    def _preliminary_class_ownership(self):
+        """Return independent atlas and localizer preliminary-class maps."""
+        classFractions = np.asarray(self.preliminaryClassFractions)
+        atlasMembership = classFractions > 0
+        if atlasMembership.shape[1] != len(self.FreeSurferLabels):
+            raise RuntimeError(
+                'Preliminary atlas memberships do not align with the '
+                'compression LUT')
+        if np.any(np.count_nonzero(atlasMembership, axis=0) != 1):
+            raise RuntimeError(
+                'Every atlas structure must have exactly one preliminary '
+                'class owner')
+
+        atlasOwners = {
+            int(label): int(classNumber)
+            for structureNumber, label in enumerate(self.FreeSurferLabels)
+            for classNumber in np.flatnonzero(
+                atlasMembership[:, structureNumber])
+        }
+        localizerOwners = {}
+        for classNumber, labels in enumerate(
+                self.preliminaryLocalizerLabelGroups):
+            for label in labels:
+                label = int(label)
+                if label in localizerOwners:
+                    raise RuntimeError(
+                        f'Localizer label {label} has multiple preliminary '
+                        'class owners')
+                localizerOwners[label] = classNumber
+        return atlasOwners, localizerOwners
+
+    def _estimate_intensity_hyperparameters(self, sameGaussianParameters):
+        """Estimate current multichannel intensity hyperparameters.
+
+        The current implementation takes per-channel medians from complete-case
+        whole-field class support, prefers an eroded support when sufficient
+        samples remain, and expresses support strength in regional-EM-equivalent
+        voxels. Classes without usable support invoke the model policy's
+        explicit zero-evidence strategy.
+        """
+        if (self.intensityPriorInitializationSegmentation is None
+                or self.intensityPriorInitializationMask is None
+                or self.intensityPriorImage is None):
+            raise RuntimeError(
+                'prepare_for_image_fitting() must materialize whole-field '
+                'initialization evidence before hyperparameters are estimated')
+        if not sf.transform.image_geometry_equal(
+                self.intensityPriorInitializationSegmentation,
+                self.intensityPriorImage,
+                tol=1e-5):
+            raise RuntimeError(
+                'Initialization labels must match the intensity-prior geometry')
+        if not sf.transform.image_geometry_equal(
+                self.intensityPriorInitializationMask,
+                self.intensityPriorImage,
+                tol=1e-5):
+            raise RuntimeError(
+                'Initialization support must match the intensity-prior geometry')
+        if self.workingImage is None:
+            raise RuntimeError(
+                'Regional EM geometry is required to scale hyperparameter '
+                'strengths')
+
+        # Establish common observation support and voxel-volume scaling.
+        data = np.asarray(self.intensityPriorImage.framed_data)
+        numberOfChannels = data.shape[-1]
+        meanHyper = np.empty(
+            (len(sameGaussianParameters), numberOfChannels),
+            dtype='float64')
+        nHyper = np.empty(len(sameGaussianParameters), dtype='float64')
+        labelsImage = self.intensityPriorInitializationSegmentation.data
+        validSupport = self.intensityPriorInitializationMask.data > 0
+        validSupport &= np.all(np.isfinite(data) & (data != 0), axis=-1)
+        priorVoxelVolume = np.prod(
+            self.intensityPriorImage.geom.voxsize)
+        emVoxelVolume = np.prod(self.workingImage.geom.voxsize)
+        aggregateSupport = validSupport & (labelsImage != 0)
+        aggregateObservations = data[aggregateSupport, :]
+        zeroEvidencePolicy = (
+            self._ensure_model_policy().zeroEvidenceInitialization)
+
+        # Prefer support eroded by approximately 1 mm in physical space. Small
+        # classes progressively relax that erosion before falling back to their
+        # full support, preserving evidence rather than changing its strength.
+        voxelSize = np.asarray(
+            self.intensityPriorImage.geom.voxsize, dtype='float64')
+        targetPhysicalRadius = 1.0
+        extents = np.ceil(targetPhysicalRadius / voxelSize).astype(int)
+        coordinates = np.ogrid[
+            tuple(slice(-extent, extent + 1) for extent in extents)]
+        squaredDistance = sum(
+            (coordinate * spacing) ** 2
+            for coordinate, spacing in zip(coordinates, voxelSize))
+        voxelCenterDistances = np.sqrt(squaredDistance)
+        representedRadii = np.unique(voxelCenterDistances[
+            (voxelCenterDistances > 0)
+            & (voxelCenterDistances < targetPhysicalRadius)])
+        candidateRadii = [
+            targetPhysicalRadius, *representedRadii[::-1].tolist()]
+        erosionStructures = []
+        for radius in candidateRadii:
+            structure = voxelCenterDistances <= radius + 1e-12
+            if not any(np.array_equal(structure, candidate)
+                       for candidate in erosionStructures):
+                erosionStructures.append(structure)
+
+        # Select class support, invoking the explicit zero-evidence strategy
+        # only when no usable class-specific observations exist.
+        for classNumber, classLabels in enumerate(sameGaussianParameters):
+            labels = np.asarray(classLabels)
+            unErodedSupport = np.isin(labelsImage, labels) & validSupport
+            if not np.any(unErodedSupport):
+                means, strength = zeroEvidencePolicy.initialize(
+                    aggregateObservations, numberOfChannels)
+                meanHyper[classNumber, :] = means
+                nHyper[classNumber] = strength
+                warnings.warn(
+                    'No usable class-specific initialization evidence for '
+                    f'class {classNumber} with labels {labels.tolist()}; '
+                    f'using {zeroEvidencePolicy.strategy!r} strategy',
+                    RuntimeWarning)
+                continue
+
+            statisticsSupport = None
+            for structure in erosionStructures:
+                eroded = scipy.ndimage.binary_erosion(
+                    unErodedSupport,
+                    structure=structure,
+                    border_value=1)
+                if np.count_nonzero(eroded) >= 10:
+                    statisticsSupport = eroded
+                    break
+            if statisticsSupport is None:
+                statisticsSupport = unErodedSupport
+
+            observations = data[statisticsSupport, :]
+            meanHyper[classNumber, :] = np.median(observations, axis=0)
+            nHyper[classNumber] = (
+                10
+                + len(observations)
+                * priorVoxelVolume
+                / emVoxelVolume)
+
+        return meanHyper, nHyper
+
+    # -------------------------------------------------------------------------
+    # Regional intensity fitting and deformation
+    # -------------------------------------------------------------------------
+
+    def prepare_for_image_fitting(self, compute_hyps=True):
+        """Prepare regional intensity fitting and initialization evidence.
+
+        The method establishes regional image and mesh state, rasterizes fitted
+        full priors, runs the post-preliminary evidence lifecycle, and only then
+        reduces classes and estimates ordinary intensity hyperparameters.
         """
 
         # Make sure the subclass has computed the target image
@@ -1028,58 +1532,58 @@ class MeshModelPlus:
         # Crop the image by the aligned atlas and compute the new mesh alignment
         self.workingImage, self.transform = self.crop_image_by_atlas(self.processedImage)
 
-        # ATH for now let's squeeze the data, but will need to adapt something better
-        # for multi-image cases down the road
+        # GEMS accepts a scalar buffer for one channel and a framed buffer for
+        # multiple channels.
         self.workingImage.data = np.asfortranarray(self.workingImage.data.squeeze())
         self.workingImageShape = self.workingImage.data.shape[:3]
 
-        # Read the atlas mesh from file, and apply the previously determined transform to the location of its nodes
-        # ATH does this have to be re-read?
+        # Load the fitted mesh and transform it onto the regional EM grid.
         self.meshCollection = gems.KvlMeshCollection()
         self.meshCollection.read(self.warpedMeshFileName)
         self.meshCollection.transform(self.transform)
         self.meshCollection.k = self.meshStiffness
 
-        # Retrieve the correct mesh to use from the meshCollection
+        # The first stored deformation is the fitted subject mesh.
         self.mesh = self.meshCollection.get_mesh(0)
 
-        # We're not interested in image areas that fall outside our cuboid ROI where our atlas is defined. Therefore,
-        # generate a mask of what's inside the ROI. Also, by convention we're skipping all voxels with zero intensity.
-        mask = (self.mesh.rasterize(self.workingImageShape).sum(-1) / 65535) > 0.99
-        if self.alphaMaskStrel > 0:
-            mask = scipy.ndimage.morphology.binary_erosion(mask, utils.spherical_strel(self.alphaMaskStrel), border_value=1)
+        # Rasterize full priors once while the mesh still has full anatomical
+        # alphas. They define both fitted support and the optional anatomical
+        # refinement seam before structural class reduction.
+        fullPriors = self.mesh.rasterize(self.workingImageShape)
+        mask = (fullPriors.sum(-1) / 65535) > 0.99
+        mask = self._apply_atlas_domain_interior_margin(
+            mask,
+            self.workingImage,
+            self._ensure_model_policy().regionalAtlasDomainInteriorMarginInMm)
 
-        # mask must be 3D to properly index the priors; test for non-0 voxels along stacked dim
-        # and force it to be 3D in the case of multi channel before creating the final mask 
-        validVoxels = self.workingImage.data > 0 if self.workingImage.data.ndim == 3 else np.all(self.workingImage.data > 0, axis=-1)
+        # Regional fitting requires a three-dimensional complete-case mask;
+        # every channel must be finite and nonzero at a retained voxel.
+        regionalData = self.workingImage.data
+        validVoxels = (
+            np.isfinite(regionalData) & (regionalData != 0)
+            if regionalData.ndim == 3
+            else np.all(
+                np.isfinite(regionalData) & (regionalData != 0), axis=-1))
         mask = np.asfortranarray(mask & validVoxels)
 
-        # Apply the mask to the image we're analyzing by setting the intensity of all voxels not belonging
-        # to the brain mask to zero. This will automatically discard those voxels in subsequent C++ routines, as
-        # voxels with intensity zero are simply skipped in the computations.
+        # GEMS skips zero-valued voxels, so materialize the semantic mask in both
+        # an explicit volume and the working image buffer.
         self.workingMask = self.workingImage.new(mask)
         self.workingImage[~mask, ...] = 0
 
-        ### DEBUG
-        print(f'mask_shape: {mask.shape}')
-        print(f'working_mask: {self.workingMask.shape}')
-
-
-        # Let's do this to make results more similar to the matlab version
-        #self.maskIndices = np.unravel_index(np.where(mask.flatten(order='F')), self.workingImageShape, order='F')
-        self.maskIndices = np.unravel_index(np.where(mask.flatten(order='F'))[0], self.workingImageShape, order='F')
-
-        #$# debug 
-        print(f"maskIndices type: {type(self.maskIndices)}")
-        print(f"maskIndices length: {len(self.maskIndices)}")
-        for i, m in enumerate(self.maskIndices):
-            print(f"maskIndices[{i}].shape: {m.shape}")
+        # Preserve GEMS' Fortran-order voxel indexing convention.
+        self.maskIndices = np.unravel_index(
+            np.where(mask.flatten(order='F'))[0],
+            self.workingImageShape,
+            order='F')
 
         # Write the initial and cropped/masked images for debugging purposes
         if self.debug:
             self.processedImage.save(os.path.join(self.tempDir, 'processedImage.mgz'))
             self.workingImage.save(os.path.join(self.tempDir, 'processedImageMasked.mgz'))
             self.workingMask.save(os.path.join(self.tempDir, 'processedImageMask.mgz'))
+
+        self._prepare_intensity_initialization_evidence(fullPriors)
 
         # Compute the Gaussian label groups
         labelGroups = self.get_label_groups()
@@ -1098,15 +1602,18 @@ class MeshModelPlus:
         self.variances = None
 
     def fit_mesh_to_image(self):
-        """
-        Fit mesh to the image data.
+        """Alternate Gaussian estimation and mesh deformation by resolution.
+
+        Each level operates on the prepared regional image and active reduced
+        classes. Two-stage models fail at their explicit transition seam unless
+        the region supplies a supported target-stage configuration.
         """
 
-        # Just get the original image buffer (array) and convert to a Kvl image object
+        # Keep one stable image buffer for all multiresolution levels.
         imageBuffer = self.workingImage.data.copy(order='K')
         image = gems.KvlImage(requireNumpyArray(imageBuffer))
 
-        # Useful to have cached
+        # Dimensions shared by posterior rasterization and class updates.
         numMaskIndices = self.maskIndices[0].shape[-1]
         numberOfClasses = len(self.sameGaussianParameters)
 
@@ -1117,8 +1624,7 @@ class MeshModelPlus:
             if self.isLong:
                 self.mesh = self.meshCollection.get_mesh(0)
 
-            # Special case when we want to recompute reduced alphas for a second-component
-            # Note: how should we deal with more than one component during longitudinal global iterations?
+            # Enter the region-defined target stage at the established level.
             if self.useTwoComponents and multiResolutionLevel == 1:
                 # Get second component label groups
                 labelGroups = self.get_second_label_groups()
@@ -1132,8 +1638,6 @@ class MeshModelPlus:
                 self.means = None
                 self.variances = None
 
-            # Set the mesh alphas back
-            # ATH is this necessary though?
             self.mesh.alphas = self.reducedAlphas
 
             # Smooth the mesh using a Gaussian kernel
@@ -1147,29 +1651,21 @@ class MeshModelPlus:
             if imageSigma > 0:
                 raise NotImplementedError('Image smoothing not implemented yet!')
 
-            # ATH this is in case the above smoothing only sets the buffer, but this should be removed
-            # really since it's not necessary if things are correctly implemented
+            # Recreate the GEMS image from the current supported image buffer.
             image = gems.KvlImage(requireNumpyArray(imageBuffer))
-            
-            # Now with this smoothed atlas, we're ready for the real work. There are essentially two sets of parameters
-            # to estimate in our generative model: (1) the mesh node locations (parameters of the prior), and (2) the
-            # means and variances of the Gaussian intensity models (parameters of the
-            # likelihood function, which is really a hugely simplistic model of the MR imaging process). Let's optimize
-            # these two sets alternately until convergence.
+
+            # Alternate likelihood-parameter and mesh-position updates.
 
             positionUpdatingMaximumNumberOfIterations = 30
             maximumNumberOfIterations = self.maxIterations[multiResolutionLevel]
-            
+
             historyOfCost = []
             for iterationNumber in range(maximumNumberOfIterations):
                 print(f'Iteration {iterationNumber + 1} of {maximumNumberOfIterations}')
 
-                # Part I: estimate Gaussian mean and variances using EM
-
-                # Get the priors as dictated by the current mesh position as well as the image intensities
-                ##$## This is where the 3D <-> 4D mask indices matter, need to build the 4D here
-                #data = imageBuffer[self.maskIndices]
-
+                # Part I: estimate Gaussian means and variances with EM.
+                # A scalar image becomes an explicit one-channel sample matrix;
+                # framed images already index to samples by channel.
                 if imageBuffer.ndim == 3:
                     data = imageBuffer[self.maskIndices].reshape(-1, 1)
 
@@ -1178,20 +1674,14 @@ class MeshModelPlus:
                     if data.ndim != 2:
                         data = data.reshape(-1, imageBuffer.shape[-1])
 
-                # Avoid spike in memory during the posterior computation
+                # Rasterize each class prior only at the fitting-mask voxels.
                 priors = np.zeros((numMaskIndices, numberOfClasses), dtype='uint16')
                 for l in range(numberOfClasses):
-                    """
-                        Rasterization will always return a 3D data shape
-                        Stack of input images will always be 4D for intensity volumes
-
-                        Add axis to the rasterization of the mask and then broadcast to be the proper shape in the 4th dim to match the input stack, this should allow us to index it based on the list of true indices 
-                    """
                     priors[:, l] = self.mesh.rasterize(self.workingImageShape, l)[self.maskIndices]
 
                 posteriors = priors / 65535
 
-                # Start EM iterations. Initialize the parameters if this is the first time ever you run this
+                # Initialize parameters on first use of the active class stage.
                 if (self.means is None) or (self.variances is None):
 
                     n_channels = 1 if imageBuffer.ndim == 3 else imageBuffer.shape[-1]
@@ -1222,8 +1712,6 @@ class MeshModelPlus:
 
                     minLogLikelihood = 0
                     for classNumber in range(numberOfClasses):
-                        
-
                         mu = self.means[classNumber]
                         variance = self.variances[classNumber]
                         prior = priors[:, classNumber] / 65535
@@ -1233,7 +1721,7 @@ class MeshModelPlus:
                         posteriors[:, classNumber] = np.exp(log_likelihood) * prior
 
                         minLogLikelihood = minLogLikelihood + 0.5 * np.sum(np.log(2 * np.pi * variance)) - 0.5 * np.log(self.nHyper[classNumber]) + 0.5 * np.sum((self.nHyper[classNumber] / variance) * (mu - self.meanHyper[classNumber]) ** 2)
-                        
+
                     normalizer = np.sum(posteriors, -1) + np.finfo(np.float32).eps
                     posteriors /= normalizer[..., np.newaxis]
                     minLogLikelihood = minLogLikelihood - np.sum(np.log(normalizer))  # This is what we're optimizing with EM
@@ -1276,7 +1764,7 @@ class MeshModelPlus:
                     # Prevents NaNs during the optimization
                     self.variances[self.variances == 0] = 100
 
-                # Part II: update the position of the mesh nodes for the current set of Gaussian parameters
+                # Part II: update mesh positions for the fitted Gaussians.
 
                 if self.isLong:
                     self.mesh = self.meshCollection.get_mesh(0)
@@ -1284,19 +1772,19 @@ class MeshModelPlus:
                 # Keep track if the mesh has moved or not
                 haveMoved = False
 
-                ##$ reshape the variances
+                # GEMS expects a full covariance matrix for each class.
                 full_variance = np.zeros((self.means.shape[0], self.means.shape[1], self.means.shape[1]))
                 for i in range(self.means.shape[0]):
                     full_variance[i] = np.diag(self.variances[i])
 
-                ##$ handle building the image list for single and multi channel
+                # Present scalar and framed data as one GEMS image per channel.
                 if imageBuffer.ndim == 3:
                     n_channels = 1
                     image_list = [gems.KvlImage(requireNumpyArray(imageBuffer))]
                 else:
                     n_channels = imageBuffer.shape[-1]
                     image_list = [gems.KvlImage(requireNumpyArray(imageBuffer[..., idx])) for idx in range(n_channels)]
-                
+
                 # Note that it uses variances instead of precisions
                 calculator = gems.KvlCostAndGradientCalculator(
                     typeName='AtlasMeshToIntensityImage',
@@ -1347,10 +1835,14 @@ class MeshModelPlus:
                 # Keep track of the cost function we're optimizing
                 previous = historyOfCost[-1] if historyOfCost else np.finfo(np.float32).max
                 historyOfCost.append(minLogLikelihoodTimesPrior)
-                
+
                 # Determine if we should stop the overall iterations over the two set of parameters
                 if not haveMoved or (((previous - minLogLikelihoodTimesPrior) / minLogLikelihoodTimesPrior) < 1e-6):
                     break
+
+    # -------------------------------------------------------------------------
+    # Segmentation and outputs
+    # -------------------------------------------------------------------------
 
     def extract_segmentation(self):
         """
@@ -1376,10 +1868,9 @@ class MeshModelPlus:
             mu = self.means[self.reducingLookupTable[classNumber]]
             variance = self.variances[self.reducingLookupTable[classNumber]]
 
-            # changed to handle multiple channels
+            # Evaluate every channel for the class selected by the reduction map.
             log_likelihood = -0.5 * np.sum(((imgdata - mu) ** 2) / variance + np.log(2 * np.pi * variance), axis=-1)
             posteriors[:, classNumber] = np.exp(log_likelihood) * (prior[self.maskIndices] / 65535)
-            #posteriors[:, classNumber] = (np.exp(-(imgdata - mu) ** 2 / 2 / variance) * (prior[self.maskIndices[:3]] / 65535)) / np.sqrt(2 * np.pi * variance)
 
         normalizer = np.sum(posteriors, -1) + np.finfo(np.float32).eps
         posteriors /= normalizer[..., np.newaxis]
@@ -1434,28 +1925,27 @@ class MeshModelPlus:
         Write the cached volume dictionary to a text file.
         """
         if volumes is None:
-            volumes = self.volumes 
+            volumes = self.volumes
         with open(filename, 'w') as file:
             for name, volume in volumes.items():
                 file.write(f'{name} {volume:.6f}\n')
 
+    # -------------------------------------------------------------------------
+    # Region extension seams
+    # -------------------------------------------------------------------------
+
     def postprocess_segmentation(self):
-        """
-        This function should perform any necessary modifications to and write the discreteLabels segmentation and labelVolumes.
-        """
+        """Apply region-specific output filtering and write final results."""
         raise NotImplementedError('A MeshModel subclass must implement the postprocess_segmentation() function!')
 
     def get_cheating_label_groups(self):
-        """
-        This function should return a group (list of lists) of label names that determine the class
-        reductions for the initial segmentation-fitting stage.
-        """
+        """Return preliminary groups when no shared-parameter artifact is set."""
         raise NotImplementedError('A MeshModel subclass must implement the get_cheating_label_groups() function!')
 
     def get_cheating_gaussians(self, sameGaussianParameters):
         """Return artificial Gaussians for preliminary segmentation fitting.
 
-        Configured profiles default to the established nonzero minimum label
+        The current configured-profile default uses the nonzero minimum label
         per localizer class and variance 0.01. Region subclasses may override
         this method when that convention does not represent their model.
         """
@@ -1477,28 +1967,17 @@ class MeshModelPlus:
         return means, variances
 
     def get_label_groups(self):
-        """
-        This function should return a group (list of lists) of label names that determine the class
-        reductions for the primary image-fitting stage.
-        """
+        """Return label groups for the first regional intensity stage."""
         raise NotImplementedError('A MeshModel subclass must implement the get_label_groups() function!')
 
     def get_gaussian_hyps(self, sameGaussianParameters, mesh):
-        """
-        This function should return a tuple of (meanHyps, nHyps) for Gaussian parameter estimation.
-        """
+        """Return mean and strength hyperparameters for the active classes."""
         raise NotImplementedError('A MeshModel subclass must implement the get_gaussian_hyps() function!')
 
     def get_second_label_groups(self):
-        """
-        This optional function should return a group (list of lists) of label names that determine the class
-        reductions for the second-component of the primary image-fitting stage.
-        """
+        """Return target-stage grouping for a supported two-stage model."""
         raise NotImplementedError('A two-component MeshModel must implement the get_second_label_groups() function!')
 
     def get_second_gaussian_hyps(self, sameGaussianParameters, meanHyper, nHyper):
-        """
-        This optional function should return a tuple of (meanHyps, nHyps) for Gaussian parameter estimation
-        in the second-component of the primary image-fitting stage.
-        """
+        """Return target-stage hyperparameters for a supported two-stage model."""
         raise NotImplementedError('A two-component MeshModel must implement the get_second_gaussian_hyps() function!')

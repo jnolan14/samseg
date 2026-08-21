@@ -1,8 +1,5 @@
 import os
-import shutil
 import numpy as np
-import scipy.ndimage
-import surfa as sf
 
 from samseg.subregions import utils
 from samseg.subregions.core_plus import MeshModelPlus
@@ -12,17 +9,28 @@ _PRELIMINARY_MODEL_PROFILE_FILES = {
     'aseg': {
         'sharedGMMParametersFileName': 'ASEGsharedGMMparameters.txt',
         'localizerLookupTableFileName': 'ASEGlocalizerLookupTable.txt',
-        'modelPolicyFileName': 'ASEGmodelPolicy.json',
     },
     'synthseg': {
         'sharedGMMParametersFileName': 'SYNTHSEGsharedGMMparameters.txt',
         'localizerLookupTableFileName': 'SYNTHSEGlocalizerLookupTable.txt',
-        'modelPolicyFileName': None,
     },
 }
 
 
 class ThalamicNucleiPlus(MeshModelPlus):
+
+    """Provide thalamus model selection and regional lifecycle behavior.
+
+    The region selects preliminary artifacts, constructs thalamic alignment and
+    crop targets, supplies first-stage label grouping and refinement decisions,
+    gates unsupported target-stage transitions, and postprocesses thalamic
+    output. ``MeshModelPlus`` owns shared geometry, initialization evidence, and
+    hyperparameter mechanics.
+    """
+
+    # -------------------------------------------------------------------------
+    # Model defaults and lifecycle configuration
+    # -------------------------------------------------------------------------
 
     def __init__(self, **kwargs):
         atlasDir = kwargs.pop('atlasDir', None)
@@ -38,7 +46,10 @@ class ThalamicNucleiPlus(MeshModelPlus):
 
         super().__init__(atlasDir=atlasDir, **kwargs)
 
+        # Resolve the region-owned preliminary model and policy artifacts.
         self.preliminaryModelDirectory = preliminaryModelDirectory
+        self.modelPolicyFileName = os.path.join(
+            preliminaryModelDirectory, 'modelPolicy.json')
         self.preliminaryModelProfiles = {
             profileName: {
                 fieldName: (
@@ -51,7 +62,8 @@ class ThalamicNucleiPlus(MeshModelPlus):
         }
         self.inputSegmentationSchemaOverride = inputSegmentationSchema
 
-        # Model thalamus with two components
+        # Preserve the two-stage boundary; the unsupported target transition
+        # fails closed through the explicit extension methods below.
         self.useTwoComponents = True
 
         # Segmentation mesh-fitting parameters
@@ -68,8 +80,9 @@ class ThalamicNucleiPlus(MeshModelPlus):
         self.longImageSmoothingSigmas = [[0, 0, 0], [0, 0, 0]]
         self.longMaxIterations = [[7, 5, 3], [3, 2, 1]]
 
-        # When creating the smooth atlas alignment target, dilate before eroding
-        self.atlasTargetSmoothing = 'forward'
+    # -------------------------------------------------------------------------
+    # Preliminary profile and regional input preparation
+    # -------------------------------------------------------------------------
 
     def preprocess_images(self):
         """Prepare preliminary targets and ordinary intensity grids.
@@ -90,7 +103,7 @@ class ThalamicNucleiPlus(MeshModelPlus):
             requestedProfileName=self.inputSegmentationSchemaOverride)
         self._ensure_preliminary_model_state()
 
-        # Atlas alignment target is a masked segmentation
+        # Build the affine target from the selected profile's thalamus classes.
         match_labels = self._get_preliminary_affine_support_labels()
         mask = np.isin(self.inputSeg.data, match_labels).astype('float32') * 255
         self.atlasAlignmentTarget = self.inputSeg.new(mask)
@@ -102,17 +115,14 @@ class ThalamicNucleiPlus(MeshModelPlus):
         self.synthImage = self._build_preliminary_synthetic_image(
             self.inputSeg)
 
-        # And also used for image cropping around the thalamus
+        # The regional field of view extends approximately 15 mm beyond the
+        # thalamus on the localizer grid.
         thalamicMask = ((self.synthImage == self.THlabelLeft)
                         | (self.synthImage == self.THlabelRight))
-        fixedMargin = int(np.round(15 / np.mean(self.inputSeg.geom.voxsize)))
+        cropMarginInVoxels = int(
+            np.round(15 / np.mean(self.inputSeg.geom.voxsize)))
         imageCropping = self.synthImage.new(thalamicMask).bbox(
-            margin=fixedMargin)
-
-        # Lastly, use it to make the image mask
-        struct = np.ones((3, 3, 3))
-        mask = scipy.ndimage.morphology.binary_dilation(self.synthImage > 1, structure=struct, iterations=2)
-        imageMask = self.synthImage.new(mask)
+            margin=cropMarginInVoxels)
 
         # Preserve the complete first-channel field of view so later
         # hyperparameter support is not constrained by the regional EM crop.
@@ -128,10 +138,12 @@ class ThalamicNucleiPlus(MeshModelPlus):
         # from its preregistered source onto this geometry.
         regionalReference = self.synthImage[imageCropping].resize(
             self.resolution, method='nearest')
-        # Materialize one shared regional mask so channel processing cannot
-        # accumulate channel-dependent mask interpolation.
-        self.longMask = imageMask.resample_like(
-            regionalReference, method='nearest')
+        # Materialize the shared policy-defined localizer-anatomical validity
+        # support directly on this grid. Later regional preparation intersects
+        # it with channel validity and the regional atlas-domain restriction.
+        self.longMask = regionalReference.new(
+            self._localizer_anatomical_support(
+                regionalReference).astype('uint8'))
         self.processedImage = self._resample_and_stack_intensity_channels(
             self.inputImageFileNames,
             regionalReference,
@@ -139,7 +151,7 @@ class ThalamicNucleiPlus(MeshModelPlus):
             mask=self.longMask)
 
     def _get_preliminary_affine_support_labels(self):
-        """Return localizer labels supporting thalamus affine alignment."""
+        """Return selected-profile labels owned by either thalamus class."""
         classNumbers = {
             className: classNumber
             for classNumber, className
@@ -160,51 +172,40 @@ class ThalamicNucleiPlus(MeshModelPlus):
             for label in self.preliminaryLocalizerLabelGroups[classNumber]
         })
 
-    def postprocess_segmentation(self):
+    # -------------------------------------------------------------------------
+    # First-stage intensity initialization
+    # -------------------------------------------------------------------------
+
+    def _refine_initialization_state(self, fullPriors):
+        """Apply the profile-specific regional initialization refinement.
+
+        ASEG needs no additional correction after generic fitted-prior
+        reconstruction. SynthSeg fails closed because its image-informed
+        choroid correction is not yet supported.
+
+        Parameters
+        ----------
+        fullPriors : numpy.ndarray
+            Full fitted-atlas priors on the regional EM grid.
+
+        Returns
+        -------
+        None
+            ASEG uses the generic reconstruction unchanged.
+
+        Raises
+        ------
+        NotImplementedError
+            If the selected profile is SynthSeg.
         """
-        Post-process the segmentation and computed volumes.
-        """
-
-        # Recode segmentation
-        A = self.discreteLabels.copy()
-        A[(A < 100) & (A != 10) & (A != 49) ] = 0
-
-        # Kill reticular labels
-        leftReticular = self.labelMapping.search('Left-R', exact=True)
-        rightReticular = self.labelMapping.search('Right-R', exact=True)
-        A[A == leftReticular] = 0
-        A[A == rightReticular] = 0
-
-        # Get only connected components (sometimes the two thalami are not connected)
-        left = utils.get_largest_cc((A < 8200) & ((A > 100) | (A == self.THlabelLeft)))
-        right = utils.get_largest_cc((A > 8200) | (A == self.THlabelRight))
-        cc_mask = left | right
-        A[cc_mask == 0] = 0
-
-        segFilePrefix = os.path.join(self.outDir, f'ThalamicNuclei{self.fileSuffix}')
-        A.save(segFilePrefix + '.mgz')
-        A.resample_like(self.inputSeg, method='nearest').save(segFilePrefix + '.FSvoxelSpace.mgz')
-
-        # Prune the volumes to what we care about (also let's leave reticular 'R' out)
-        validLabels = ['L-Sg', 'LGN', 'MGN', 'PuI', 'PuM', 'H', 'PuL',
-                       'VPI', 'PuA', 'MV(Re)', 'Pf', 'CM', 'LP', 'VLa', 'VPL', 'VLp',
-                       'MDm', 'VM', 'CeM', 'MDl', 'Pc', 'MDv', 'Pv', 'CL', 'VA', 'VPM',
-                       'AV', 'VAmc', 'Pt', 'AD', 'LD']
-        isValid = lambda name: (name.replace('Left-', '') in validLabels) or (name.replace('Right-', '') in validLabels)
-        self.volumes = {name: vol for name, vol in self.volumes.items() if isValid(name)}
-
-        # Sum up the total volumes per hemisphere 
-        self.volumes['Left-Whole_thalamus'] = np.sum([vol for name, vol in self.volumes.items() if name.startswith('Left')])
-        self.volumes['Right-Whole_thalamus'] = np.sum([vol for name, vol in self.volumes.items() if name.startswith('Right')])
-
-        # Write the volumes
-        self.write_volumes(segFilePrefix + '.volumes.txt')
+        if self.preliminaryModelProfileName == 'synthseg':
+            raise NotImplementedError(
+                'SynthSeg initialization requires supported choroid refinement '
+                'before intensity hyperparameters can be estimated')
+        return super()._refine_initialization_state(fullPriors)
 
     def get_label_groups(self):
-        """
-        Return a group (list of lists) of label names that determine the class reductions for
-        the primary image-fitting stage.
-        """
+        """Return the current coarse grouping for first-stage intensity fitting."""
         labelGroups = [
             ['Unknown'],
             ['Left-Cerebral-White-Matter', 'Left-R', 'Right-R'],
@@ -221,115 +222,127 @@ class ThalamicNucleiPlus(MeshModelPlus):
             ['Left-VentralDC', 'Right-VentralDC'],
         ]
 
-        # Configure left/right thalamic labels
+        # The first stage models all bilateral thalamic nuclei together. This
+        # grouping is distinct from the output-reporting whitelist below.
         thalamicLabels = [
-            'L-Sg', 'LGN', 'MGN', 'PuI', 'PuM', 'H', 'PuL', 'VPI', 'PuA', 'MV(Re)', 'Pf',
-            'CM', 'LP', 'VLa', 'VPL', 'VLp', 'MDm', 'VM', 'CeM', 'MDl', 'Pc', 'MDv', 'Pv',
-            'CL', 'VA', 'VPM', 'AV', 'VAmc', 'Pt', 'AD', 'LD',
+            'L-Sg', 'LGN', 'MGN', 'PuI', 'PuM', 'H', 'PuL', 'VPI',
+            'PuA', 'MV(Re)', 'Pf', 'CM', 'LP', 'VLa', 'VPL', 'VLp',
+            'MDm', 'VM', 'CeM', 'MDl', 'Pc', 'MDv', 'Pv', 'CL', 'VA',
+            'VPM', 'AV', 'VAmc', 'Pt', 'AD', 'LD',
         ]
-        labelGroups.append([f'{side}-{label}' for side in ('Left', 'Right') for label in thalamicLabels])
+        labelGroups.append([
+            f'{side}-{label}'
+            for side in ('Left', 'Right')
+            for label in thalamicLabels
+        ])
         return labelGroups
 
     def get_gaussian_hyps(self, sameGaussianParameters, mesh):
-        """Estimate intensity Gaussian hyperparameters after atlas fitting.
+        """Return first-stage hyperparameters from whole-field evidence.
 
-        Masks come from the full-label reconstruction produced by the fitted
-        preliminary mesh, not from source-localizer boundaries that were
-        deliberately collapsed during preliminary deformation.
+        ``MeshModelPlus`` owns the generic estimator; thalamus contributes the
+        active label grouping and model policy.
+
+        Parameters
+        ----------
+        sameGaussianParameters : sequence of sequence of int
+            Full atlas labels sharing each intensity Gaussian.
+        mesh : object
+            Retained by the inherited region hook. The fitted mesh has already
+            contributed through initialization reconstruction.
+
+        Returns
+        -------
+        meanHyper : numpy.ndarray
+            Class-by-channel prior means.
+        nHyper : numpy.ndarray
+            Effective prior sample count for each class.
         """
-        if (self.initializationSegmentation is None
-                or self.initializationMask is None):
-            raise RuntimeError(
-                'fit_mesh_to_seg() must reconstruct initialization state '
-                'before Gaussian hyperparameters are estimated')
+        return self._estimate_intensity_hyperparameters(
+            sameGaussianParameters)
 
-        nHyper = np.zeros(len(sameGaussianParameters))
-        meanHyper = np.zeros(len(sameGaussianParameters))
-
-        # TODO this needs to be adapted for multi-image cases (with masking)
-        DATA = self.inputImages[0]
-
-        for g in range(len(sameGaussianParameters)):
-            
-            labels = np.array(sameGaussianParameters[g])
-
-            if len(labels) > 0:
-                MASK = np.isin(
-                    self.initializationSegmentation.data,
-                    labels)
-                MASK &= self.initializationMask.data
-                radius = np.round(1 / np.mean(DATA.geom.voxsize))
-                MASK = scipy.ndimage.morphology.binary_erosion(MASK, utils.spherical_strel(radius), border_value=1)
-                total_mask = MASK & (DATA.data > 0)
-                data = DATA.data[total_mask]
-                meanHyper[g] = np.median(data)
-                if any(labels == 28):
-                    # Special case: VDE is kind of bimodal in FreeSurfer
-                    nHyper[g] = 10
-                else:
-                    nHyper[g] = 10 + len(data) * np.prod(DATA.geom.voxsize) / (self.resolution ** 3)
-
-        # If any NaN, replace by background
-        # ATH: I don't there would ever be NaNs here?
-        nans = np.isnan(meanHyper)
-        meanHyper[nans] = 55
-        nHyper[nans] = 10
-
-        return (meanHyper, nHyper)
+    # -------------------------------------------------------------------------
+    # Deferred intensity-stage transition gates
+    # -------------------------------------------------------------------------
 
     def get_second_label_groups(self):
-        """
-        Return a group (list of lists) of label names that determine the class reductions for the
-        second-component of the primary image-fitting stage.
-        """
-        labelGroups = [
-            ['Unknown'],
-            ['Left-Cerebral-White-Matter', 'Left-R', 'Right-R'],
-            ['Left-Cerebral-Cortex'],
-            ['Left-Cerebellum-Cortex'],
-            ['Left-Cerebellum-White-Matter'],
-            ['Brain-Stem'],
-            ['Left-Lateral-Ventricle'],
-            ['Left-choroid-plexus'],
-            ['Left-Putamen'],
-            ['Left-Pallidum'],
-            ['Left-Accumbens-area'],
-            ['Left-Caudate'],
-            ['Left-VentralDC', 'Right-VentralDC'],
-            ['Left-L-Sg', 'Left-LGN', 'Left-MGN', 'Left-H',
-            'Left-VPI', 'Left-MV(Re)', 'Left-Pf', 'Left-CM', 'Left-LP', 'Left-VLa', 'Left-VPL', 'Left-VLp',
-            'Left-VM', 'Left-CeM', 'Left-Pc', 'Left-MDv', 'Left-Pv', 'Left-CL', 'Left-VA', 'Left-VPM',
-            'Left-AV', 'Left-VAmc', 'Left-Pt', 'Left-AD', 'Left-LD', 'Right-L-Sg', 'Right-LGN', 'Right-MGN', 'Right-H',
-            'Right-VPI', 'Right-MV(Re)', 'Right-Pf', 'Right-CM', 'Right-LP', 'Right-VLa', 'Right-VPL', 'Right-VLp',
-            'Right-VM', 'Right-CeM', 'Right-Pc', 'Right-MDv', 'Right-Pv', 'Right-CL', 'Right-VA', 'Right-VPM',
-            'Right-AV', 'Right-VAmc', 'Right-Pt', 'Right-AD', 'Right-LD'],
-            ['Left-PuA', 'Left-PuI', 'Left-PuL', 'Left-PuM', 'Left-MDl', 'Left-MDm',
-            'Right-PuA', 'Right-PuI', 'Right-PuL', 'Right-PuM', 'Right-MDl', 'Right-MDm']
-        ]
-        return labelGroups
+        """Fail until a configured target-stage grouping is available."""
+        raise NotImplementedError(
+            'ThalamicNucleiPlus refinement requires configured source and '
+            'target intensity stages with atlas-membership correspondence')
 
     def get_second_gaussian_hyps(self, sameGaussianParameters, meanHyper, nHyper):
-        """
-        Return a tuple of (meanHyps, nHyps) for Gaussian parameter estimation in the second-component
-        of the primary image-fitting stage.
-        """
-        WMind = 1
-        GMind = 2
-        ThInt = meanHyper[-1]
+        """Fail until target-stage hyperparameters and transfer are available."""
+        raise NotImplementedError(
+            'ThalamicNucleiPlus refinement hyperparameters require configured '
+            'source and target intensity stages')
 
-        # TODO this needs to be enabled with non-T1s are used
-        if True:
-            # Lateral, brighter
-            nHyper[-1] = 25
-            meanHyper[-1] = ThInt + 5
-            # Medial, darker
-            nHyper = np.append(nHyper, 25)
-            meanHyper = np.append(meanHyper, ThInt - 5)
-        else:
-            nHyper[-1] = 25
-            nHyper = np.append(nHyper, 25)
-            # Lateral, more WM-ish (e.g., darker, in FGATIR)
-            meanHyper[-1] = ThInt * (0.95 + 0.1 * (meanHyper[WMind] >= meanHyper[GMind]))
-            # Medial, more GM-ish (e.g., brighter, in FGATIR)
-            meanHyper = np.append(meanHyper, ThInt * (0.95 + 0.1 * (meanHyper[WMind] < meanHyper[GMind])))
-        return (meanHyper, nHyper)
+    # -------------------------------------------------------------------------
+    # Segmentation output
+    # -------------------------------------------------------------------------
+
+    def postprocess_segmentation(self):
+        """Filter connected thalamic output and write reported nucleus volumes."""
+
+        # Retain nucleus labels and the canonical whole-thalamus labels.
+        segmentation = self.discreteLabels.copy()
+        segmentation[
+            (segmentation < 100)
+            & (segmentation != 10)
+            & (segmentation != 49)
+        ] = 0
+
+        # Reticular labels participate in fitting but are not reported.
+        leftReticular = self.labelMapping.search('Left-R', exact=True)
+        rightReticular = self.labelMapping.search('Right-R', exact=True)
+        segmentation[segmentation == leftReticular] = 0
+        segmentation[segmentation == rightReticular] = 0
+
+        # Nucleus LUT labels use the 81xx namespace on the left and 82xx on the
+        # right; whole-thalamus labels 10 and 49 are handled explicitly.
+        leftComponent = utils.get_largest_cc(
+            (segmentation < 8200)
+            & ((segmentation > 100)
+               | (segmentation == self.THlabelLeft)))
+        rightComponent = utils.get_largest_cc(
+            (segmentation > 8200)
+            | (segmentation == self.THlabelRight))
+        connectedThalami = leftComponent | rightComponent
+        segmentation[connectedThalami == 0] = 0
+
+        segFilePrefix = os.path.join(
+            self.outDir, f'ThalamicNuclei{self.fileSuffix}')
+        segmentation.save(segFilePrefix + '.mgz')
+        segmentation.resample_like(
+            self.inputSeg, method='nearest').save(
+                segFilePrefix + '.FSvoxelSpace.mgz')
+
+        # The current set of nuclei reported in the volumes file intentionally
+        # excludes reticular labels.
+        reportedNucleusNames = [
+            'L-Sg', 'LGN', 'MGN', 'PuI', 'PuM', 'H', 'PuL', 'VPI',
+            'PuA', 'MV(Re)', 'Pf', 'CM', 'LP', 'VLa', 'VPL', 'VLp',
+            'MDm', 'VM', 'CeM', 'MDl', 'Pc', 'MDv', 'Pv', 'CL', 'VA',
+            'VPM', 'AV', 'VAmc', 'Pt', 'AD', 'LD',
+        ]
+        isReportedNucleus = lambda name: (
+            name.replace('Left-', '') in reportedNucleusNames
+            or name.replace('Right-', '') in reportedNucleusNames)
+        self.volumes = {
+            name: volume
+            for name, volume in self.volumes.items()
+            if isReportedNucleus(name)
+        }
+
+        # Add whole-thalamus totals for the retained nuclei in each hemisphere.
+        self.volumes['Left-Whole_thalamus'] = np.sum([
+            volume for name, volume in self.volumes.items()
+            if name.startswith('Left')
+        ])
+        self.volumes['Right-Whole_thalamus'] = np.sum([
+            volume for name, volume in self.volumes.items()
+            if name.startswith('Right')
+        ])
+
+        # Write the volumes
+        self.write_volumes(segFilePrefix + '.volumes.txt')
