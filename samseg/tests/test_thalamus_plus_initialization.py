@@ -207,6 +207,60 @@ def _refinement_model():
     return model
 
 
+def _synthseg_refinement_model(fittedLabels, intensities, bilateral=True):
+    """Build fitted regional evidence with nonstandard semantic label values."""
+    if bilateral:
+        atlasLabels = [0, 401, 402, 403, 501, 502]
+        atlasNames = [
+            'Unknown',
+            'Left-Lateral-Ventricle',
+            'Right-Lateral-Ventricle',
+            '3rd-Ventricle',
+            'Left-choroid-plexus',
+            'Right-choroid-plexus',
+        ]
+        priorWeights = [0, 16000, 16000, 13535, 10000, 10000]
+    else:
+        # The tracked historical atlas has a unilateral left C/V family; its
+        # single side-named choroid target is not a bilateral fallback.
+        atlasLabels = [0, 401, 501]
+        atlasNames = [
+            'Unknown',
+            'Left-Lateral-Ventricle',
+            'Left-choroid-plexus',
+        ]
+        priorWeights = [0, 45535, 20000]
+
+    fittedLabels = np.asarray(fittedLabels, dtype='int32')
+    shape = (len(fittedLabels), 1, 1)
+    model = object.__new__(ThalamicNucleiPlus)
+    model.preliminaryModelProfileName = 'synthseg'
+    model.FreeSurferLabels = np.asarray(atlasLabels)
+    model.names = atlasNames
+    model.preliminaryClassNames = ['Unknown', 'Ventricle']
+    model.preliminaryClassFractions = np.zeros(
+        (2, len(atlasLabels)), dtype='float32')
+    model.preliminaryClassFractions[0, 0] = 1
+    model.preliminaryClassFractions[1, 1:] = 1
+    model.workingImage = _volume(
+        np.asarray(intensities, dtype='float32').reshape(shape))
+    model.workingInitializationSegmentation = _volume(
+        fittedLabels.reshape(shape))
+    model.workingInitializationMask = _volume(
+        np.ones(shape, dtype='uint8'))
+    model.initializationSegmentation = (
+        model.workingInitializationSegmentation.copy())
+    model.initializationMask = model.workingInitializationMask.copy()
+    model.labelMapping = sf.LabelLookup()
+
+    # Every candidate has both anatomical alternatives. Their common scale is
+    # irrelevant to the likelihood-times-prior comparison.
+    priorWeights = np.asarray(priorWeights, dtype='float64')
+    fullPriors = np.broadcast_to(
+        priorWeights, shape + (len(atlasLabels),)).copy()
+    return model, fullPriors
+
+
 def test_no_refinement_preserves_initialization_values_and_geometry():
     model = _refinement_model()
     originalSegmentation = model.initializationSegmentation.data.copy()
@@ -254,14 +308,92 @@ def test_regional_refinement_rejects_changes_outside_fitted_support():
         model._apply_working_initialization_refinement(refined)
 
 
-def test_synthseg_initialization_refinement_fails_until_choroid_path_is_supported():
-    """SynthSeg needs unsupported choroid refinement; ASEG needs no refinement."""
+@pytest.mark.parametrize(
+    'bilateral',
+    [True, False],
+    ids=['bilateral-choroid', 'unilateral-historical-choroid'],
+)
+def test_synthseg_refinement_overlays_choroid_from_oriented_joint_evidence(
+        bilateral):
+    """Use rough fitted choroid to orient modes, then overlay choroid.
+
+    The bilateral case uses deliberately nonstandard left/right and midline
+    labels; the historical case is genuinely unilateral. In both, provisional
+    choroid spans the two intensity modes but favors the high mode, without
+    assuming whether choroid should be bright or dark. Low-mode provisional
+    choroid remains unchanged because a ventricular score does not write back.
+    """
+    if bilateral:
+        fittedLabels = [
+            401, 402, 403, 401, 501,
+            501, 502, 501, 401, 402, 403, 402,
+        ]
+        intensities = [10, 11, 9, 12, 13, 90, 91, 89, 92, 93, 94, 88]
+        expected = np.array([
+            401, 402, 403, 401, 501,
+            501, 502, 501, 501, 502, 403, 402,
+        ])
+    else:
+        fittedLabels = [401, 501, 401, 501, 501, 401]
+        intensities = [10, 11, 12, 90, 91, 92]
+        expected = np.array([401, 501, 401, 501, 501, 501])
+    model, fullPriors = _synthseg_refinement_model(
+        fittedLabels, intensities, bilateral=bilateral)
+    if bilateral:
+        # The final high-intensity right-ventricle voxel has zero fitted
+        # choroid prior, proving that image-mode membership alone cannot
+        # promote it.
+        fullPriors[11, 0, 0, 4:] = 0
+        fullPriors[11, 0, 0, 1] += 20000
+    original = model.workingInitializationSegmentation.data.copy()
+
+    first = model._refine_initialization_state(fullPriors)
+    second = model._refine_initialization_state(fullPriors)
+
+    np.testing.assert_array_equal(first.data[:, 0, 0], expected)
+    np.testing.assert_array_equal(second.data, first.data)
+    np.testing.assert_array_equal(
+        model.workingInitializationSegmentation.data, original)
+
+
+@pytest.mark.parametrize(
+    ('fittedLabels', 'intensities', 'warning'),
+    [
+        pytest.param(
+            [501, 401, 402, 502, 401, 402],
+            [10, 11, 12, 90, 91, 92],
+            'fitted choroid support does not resolve',
+            id='choroid-orientation-support-ties'),
+        pytest.param(
+            [501, 401, 402, 501],
+            [10, 10, 10, 10],
+            'two distinct subject-intensity modes',
+            id='intensity-modes-are-degenerate'),
+    ],
+)
+def test_synthseg_refinement_warns_and_preserves_fitted_labels_when_evidence_is_unusable(
+        fittedLabels, intensities, warning):
+    """Ambiguous orientation or unusable modes must preserve fitted anatomy.
+
+    The first case places one provisional choroid voxel in each mode, tying the
+    mature orientation vote. The second has no intensity separation.
+    """
+    model, fullPriors = _synthseg_refinement_model(
+        fittedLabels, intensities)
+    original = model.initializationSegmentation.data.copy()
+
+    with pytest.warns(RuntimeWarning, match=warning):
+        refinement = model._refine_initialization_state(fullPriors)
+    segmentation, support = model._apply_working_initialization_refinement(
+        refinement)
+
+    np.testing.assert_array_equal(segmentation.data, original)
+    np.testing.assert_array_equal(
+        support.data, model.initializationMask.data)
+
+
+def test_aseg_initialization_requires_no_regional_refinement():
     model = object.__new__(ThalamicNucleiPlus)
-    model.preliminaryModelProfileName = 'synthseg'
-
-    with pytest.raises(NotImplementedError, match='choroid refinement'):
-        model._refine_initialization_state(np.empty((0,)))
-
     model.preliminaryModelProfileName = 'aseg'
     assert model._refine_initialization_state(np.empty((0,))) is None
 

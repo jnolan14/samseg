@@ -1,5 +1,9 @@
 import os
+import warnings
+
 import numpy as np
+from scipy.stats import multivariate_normal
+from sklearn.cluster import KMeans
 
 from samseg.subregions import utils
 from samseg.subregions.core_plus import MeshModelPlus
@@ -180,8 +184,10 @@ class ThalamicNucleiPlus(MeshModelPlus):
         """Apply the profile-specific regional initialization refinement.
 
         ASEG needs no additional correction after generic fitted-prior
-        reconstruction. SynthSeg fails closed because its image-informed
-        choroid correction is not yet supported.
+        reconstruction. SynthSeg uses subject intensities to distinguish the
+        choroid and ventricular modes that its preliminary model must merge.
+        Rough fitted atlas labels orient the anonymous modes; fitted soft
+        priors then contribute to the voxelwise correction.
 
         Parameters
         ----------
@@ -190,19 +196,185 @@ class ThalamicNucleiPlus(MeshModelPlus):
 
         Returns
         -------
-        None
-            ASEG uses the generic reconstruction unchanged.
-
-        Raises
-        ------
-        NotImplementedError
-            If the selected profile is SynthSeg.
+        surfa.Volume or None
+            Corrected regional labels for SynthSeg. ASEG, or a SynthSeg case
+            without usable or orientable modes, retains the fitted
+            reconstruction unchanged.
         """
-        if self.preliminaryModelProfileName == 'synthseg':
-            raise NotImplementedError(
-                'SynthSeg initialization requires supported choroid refinement '
-                'before intensity hyperparameters can be estimated')
-        return super()._refine_initialization_state(fullPriors)
+        if self.preliminaryModelProfileName != 'synthseg':
+            return super()._refine_initialization_state(fullPriors)
+
+        def retain_fitted_labels(reason):
+            warnings.warn(
+                'SynthSeg choroid refinement retained the fitted atlas labels: '
+                + reason,
+                RuntimeWarning,
+                stacklevel=2)
+            return None
+
+        # The private hook relies on model, geometry, support, and observation
+        # invariants established by the mandatory generic lifecycle.
+        priors = np.asarray(fullPriors)
+        labels = np.asarray(self.FreeSurferLabels)
+        names = [str(name) for name in self.names]
+        classNames = list(self.preliminaryClassNames)
+        classFractions = np.asarray(self.preliminaryClassFractions)
+        fittedLabels = np.asarray(
+            self.workingInitializationSegmentation.data)
+        fittedSupport = np.asarray(
+            self.workingInitializationMask.data) > 0
+        observations = np.asarray(
+            self.workingImage.framed_data, dtype='float64')
+
+        # The preliminary Ventricle class defines the complete candidate
+        # family. Choroid is separated semantically; every remaining member is
+        # complementary ventricular evidence, without adding unrelated CSF.
+        ventricleClass = classNames.index('Ventricle')
+        familyStructures = np.flatnonzero(
+            classFractions[ventricleClass, :] > 0)
+        choroidStructures = np.asarray([
+            structureNumber
+            for structureNumber in familyStructures
+            if 'choroid' in names[structureNumber].lower()
+        ], dtype='int64')
+        ventricularStructures = np.setdiff1d(
+            familyStructures, choroidStructures, assume_unique=True)
+
+        choroidLabels = labels[choroidStructures]
+        familyLabels = labels[familyStructures]
+        candidateSupport = (
+            fittedSupport & np.isin(fittedLabels, familyLabels))
+        if not np.any(candidateSupport):
+            return retain_fitted_labels(
+                'the fitted ventricle/choroid candidate support is empty')
+
+        candidateLabels = fittedLabels[candidateSupport]
+        candidateObservations = observations[candidateSupport, :]
+        if (len(candidateObservations) < 2
+                or len(np.unique(candidateObservations, axis=0)) < 2):
+            return retain_fitted_labels(
+                'two distinct subject-intensity modes cannot be formed')
+
+        # K-means supplies only anonymous subject-intensity assignments. Fit
+        # ordinary Gaussian moments to those assignments for the anatomical
+        # orientation and subsequent likelihood comparison.
+        assignments = KMeans(
+            n_clusters=2,
+            random_state=0,
+            n_init=10).fit_predict(candidateObservations)
+        if len(np.unique(assignments)) != 2:
+            return retain_fitted_labels(
+                'subject-intensity clustering did not produce two modes')
+
+        logLikelihoods = np.empty((len(candidateObservations), 2))
+        for gaussianNumber in range(2):
+            clusterObservations = candidateObservations[
+                assignments == gaussianNumber, :]
+            if len(clusterObservations) < 2:
+                return retain_fitted_labels(
+                    'an intensity mode has insufficient covariance evidence')
+            mean = np.mean(clusterObservations, axis=0)
+            covariance = np.atleast_2d(np.cov(
+                clusterObservations, rowvar=False, ddof=1))
+            if (not np.all(np.isfinite(mean))
+                    or not np.all(np.isfinite(covariance))):
+                return retain_fitted_labels(
+                    'an intensity mode has nonfinite Gaussian parameters')
+            try:
+                logLikelihoods[:, gaussianNumber] = (
+                    multivariate_normal.logpdf(
+                        candidateObservations,
+                        mean=mean,
+                        cov=covariance,
+                        allow_singular=False))
+            except (ValueError, np.linalg.LinAlgError):
+                return retain_fitted_labels(
+                    'an intensity mode has unusable covariance')
+
+        if not np.all(np.isfinite(logLikelihoods)):
+            return retain_fitted_labels(
+                'the fitted intensity modes have nonfinite likelihoods')
+
+        def preferred_gaussian(orientationSupport):
+            votes = [
+                np.count_nonzero(
+                    orientationSupport
+                    & (logLikelihoods[:, gaussianNumber]
+                       > logLikelihoods[:, 1 - gaussianNumber]))
+                for gaussianNumber in range(2)
+            ]
+            if votes[0] == votes[1]:
+                return None
+            return int(votes[1] > votes[0])
+
+        # Reproduce the mature likelihood-preference vote on rough fitted
+        # choroid. This provisional atlas partition is used here to resolve the
+        # anonymous mode identities; the positive-overlay decision below uses
+        # the fitted soft priors and image likelihoods.
+        choroidGaussian = preferred_gaussian(
+            np.isin(candidateLabels, choroidLabels))
+        if choroidGaussian is None:
+            return retain_fitted_labels(
+                'fitted choroid support does not resolve the two intensity '
+                'modes')
+        ventricularGaussian = 1 - choroidGaussian
+
+        # Once the anonymous modes are oriented, soft fitted priors participate
+        # in the actual voxelwise refinement. The log-domain comparison is
+        # equivalent to multiplying MATLAB's relative likelihoods by priors.
+        choroidPrior = np.sum(
+            priors[..., choroidStructures], axis=-1, dtype='float64')[
+                candidateSupport]
+        ventricularPrior = np.sum(
+            priors[..., ventricularStructures], axis=-1, dtype='float64')[
+                candidateSupport]
+        logChoroidPrior = np.full(len(choroidPrior), -np.inf)
+        logVentricularPrior = np.full(len(ventricularPrior), -np.inf)
+        np.log(
+            choroidPrior,
+            out=logChoroidPrior,
+            where=choroidPrior > 0)
+        np.log(
+            ventricularPrior,
+            out=logVentricularPrior,
+            where=ventricularPrior > 0)
+        logChoroidScore = (
+            logLikelihoods[:, choroidGaussian] + logChoroidPrior)
+        logVentricularScore = (
+            logLikelihoods[:, ventricularGaussian] + logVentricularPrior)
+        choroidWins = logChoroidScore > logVentricularScore
+
+        # The mature result is a positive choroid overlay on the existing full
+        # fitted reconstruction. Every non-winning or unmappable label remains
+        # unchanged; there is no symmetric ventricular writeback.
+        lowerNames = [name.lower() for name in names]
+        refinedSegmentation = self.workingInitializationSegmentation.copy()
+        refinedCandidateLabels = candidateLabels.copy()
+
+        # Apply choroid labels only where the posterior evidence wins and the
+        # provisional full label supplies usable hemisphere information.
+        for side in ('left', 'right'):
+            sideChoroidLabels = labels[[
+                structureNumber
+                for structureNumber in choroidStructures
+                if side in lowerNames[structureNumber]
+            ]]
+            if not len(sideChoroidLabels):
+                continue
+            sideFamilyLabels = labels[[
+                structureNumber
+                for structureNumber in familyStructures
+                if side in lowerNames[structureNumber]
+            ]]
+            refinedCandidateLabels[
+                choroidWins
+                & np.isin(candidateLabels, sideFamilyLabels)
+            ] = sideChoroidLabels[0]
+
+        refinedSegmentation.data[candidateSupport] = refinedCandidateLabels
+
+        refinedSegmentation.labels = self.labelMapping
+        return refinedSegmentation
 
     def get_label_groups(self):
         """Return the current coarse grouping for first-stage intensity fitting."""
