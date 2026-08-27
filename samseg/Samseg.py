@@ -628,7 +628,7 @@ class Samseg:
         
         # check if fsbindings package is installed, which is required to save a GCA morph
         import importlib
-        spec = importlib.util.find_spec('fsbindings')
+        spec = importlib.util.find_spec('fsbindings.fsbindings')
         if (spec):
             # writing a GCA morph requires the fsbindings to be built - this is usually only the case
             # for complete development builds or in distributed freesurfer releases
