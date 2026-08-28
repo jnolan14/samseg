@@ -7,8 +7,13 @@ import numpy as np
 import surfa as sf
 import scipy.ndimage
 from samseg import gems
+from samseg.GMM import GMM
 from samseg.io import kvlReadSharedGMMParameters
-from samseg.merge_alphas import kvlGetMergingFractionsTable, kvlMergeAlphas
+from samseg.merge_alphas import (
+    kvlGetMergingFractionsTable,
+    kvlMergeAlphas,
+    kvlResolveSharedGMMParameters,
+)
 from samseg.utilities import requireNumpyArray
 from samseg.subregions import utils
 from samseg.subregions.model_policy import SubregionModelPolicy
@@ -51,6 +56,7 @@ class MeshModelPlus:
         fileSuffix='',
         debug=False,
         preliminarySharedGMMParametersFileName=None,
+        gmmFileName=None,
         ):
         """Initialize shared lifecycle state and region-configurable defaults."""
 
@@ -64,6 +70,7 @@ class MeshModelPlus:
         self.inputSegFileName = inputSegFileName
         self.preliminarySharedGMMParametersFileName = (
             preliminarySharedGMMParametersFileName)
+        self.gmmFileName = gmmFileName
         self.preliminaryModelProfileName = None
         self.preliminaryLocalizerLookupTableFileName = None
         self.modelPolicyFileName = None
@@ -106,12 +113,11 @@ class MeshModelPlus:
         # aligned stack is reserved for intensity-prior and hyperparameter use.
         self.intensityPriorReferenceImage = None
         self.intensityPriorImage = None
-        # This stage belongs to the ordinary intensity model. Descendants that
-        # add diffusion own their separate model state and lifecycle.
-        self.intensityStage = None
+        # The structural shared-parameter model remains separate from the
+        # preliminary localizer model above.
+        self.sharedGMMParameters = None
+        self.classFractions = None
         self.gmm = None
-        self.bootstrapGMMState = None
-        self.lastValidFittedGMMState = None
         self.optimizationHistory = []
 
         # Some optimization defaults that should be overwritten by each subclass
@@ -175,6 +181,7 @@ class MeshModelPlus:
 
         # Load compressed and FreeSurfer label mapping information
         self.labelMapping, self.names, self.FreeSurferLabels = utils.read_compression_lookup_table(self.compressionLookupTableFileName)
+        self._configure_shared_gmm_parameters()
 
         # Set the target mesh file paths
         self.warpedMeshFileName = os.path.join(self.tempDir, 'warpedOriginalMesh.txt')
@@ -192,6 +199,47 @@ class MeshModelPlus:
         # Region preprocessing supplies the anatomical targets and stage-specific
         # intensity representations described by preprocess_images().
         self.preprocess_images()
+
+    def _configure_shared_gmm_parameters(self):
+        """Resolve the configured structural GMM against the selected LUT."""
+        if self.gmmFileName is None:
+            raise ValueError(
+                'A structural GMM parameter file must be supplied through '
+                'gmmFileName')
+
+        gmmFileName = os.fspath(self.gmmFileName)
+        if not os.path.isfile(gmmFileName):
+            gmmFileName = os.path.join(self.atlasDir, gmmFileName)
+        if not os.path.isfile(gmmFileName):
+            raise ValueError(
+                f'GMM parameter file does not exist: {gmmFileName}')
+
+        configuredParameters = kvlReadSharedGMMParameters(gmmFileName)
+        sharedGMMParameters, memberships = (
+            kvlResolveSharedGMMParameters(
+                self.names, configuredParameters))
+
+        componentCounts = np.asarray([
+            parameter.numberOfComponents
+            for parameter in sharedGMMParameters
+        ])
+        if np.any(componentCounts <= 0):
+            raise ValueError(
+                'Structural shared-GMM component counts must be positive')
+        if np.any(componentCounts > 1):
+            raise NotImplementedError(
+                'Plus structural GMM initialization does not yet support '
+                'shared-parameter rows with multiple components')
+        if np.any(np.count_nonzero(memberships, axis=0) > 1):
+            raise NotImplementedError(
+                'Plus structural GMM initialization does not yet support '
+                'structures shared across multiple parameter rows')
+
+        self.gmmFileName = gmmFileName
+        self.sharedGMMParameters = sharedGMMParameters
+        # In the supported disjoint case, mature Boolean membership and
+        # maintained SAMSEG class fractions are exactly equivalent.
+        self.classFractions = memberships.astype(float)
 
     # -------------------------------------------------------------------------
     # Regional preprocessing and shared input geometry
@@ -1585,17 +1633,32 @@ class MeshModelPlus:
 
         self._prepare_intensity_initialization_evidence(fullPriors)
 
-        # Compute the Gaussian label groups
-        labelGroups = self.get_label_groups()
-        self.sameGaussianParameters = self.label_group_names_to_indices(labelGroups)
-
-        # Compute the reduced alphas
-        self.reducedAlphas, self.reducingLookupTable = self.reduce_alphas(self.sameGaussianParameters)
+        # Materialize the supported one-hot structural model for the copied
+        # categorical-evidence and fitting consumers that remain authoritative.
+        FreeSurferLabels = np.asarray(self.FreeSurferLabels)
+        self.sameGaussianParameters = [
+            FreeSurferLabels[fractions > 0].tolist()
+            for fractions in self.classFractions
+        ]
+        self.reducedAlphas = kvlMergeAlphas(
+            self.originalAlphas, self.classFractions)
+        self.reducingLookupTable = np.argmax(
+            self.classFractions, axis=0)
         self.mesh.alphas = self.reducedAlphas
 
+        self.gmm = None
         if compute_hyps:
             # Compute the hyperparameters
-            self.meanHyper, self.nHyper = self.get_gaussian_hyps(self.sameGaussianParameters, self.mesh)
+            self.meanHyper, self.nHyper = self.get_gaussian_hyps(
+                self.sameGaussianParameters,
+                self.mesh)
+            self.gmm = GMM(
+                [parameter.numberOfComponents
+                 for parameter in self.sharedGMMParameters],
+                numberOfContrasts=self.meanHyper.shape[1],
+                useDiagonalCovarianceMatrices=True,
+                initialHyperMeans=self.meanHyper.copy(),
+                initialHyperMeansNumberOfMeasurements=self.nHyper.copy())
 
         # Init empty means and variances
         self.means = None
@@ -1965,10 +2028,6 @@ class MeshModelPlus:
             0.01,
             dtype=float)
         return means, variances
-
-    def get_label_groups(self):
-        """Return label groups for the first regional intensity stage."""
-        raise NotImplementedError('A MeshModel subclass must implement the get_label_groups() function!')
 
     def get_gaussian_hyps(self, sameGaussianParameters, mesh):
         """Return mean and strength hyperparameters for the active classes."""

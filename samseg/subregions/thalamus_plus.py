@@ -26,10 +26,10 @@ class ThalamicNucleiPlus(MeshModelPlus):
     """Provide thalamus model selection and regional lifecycle behavior.
 
     The region selects preliminary artifacts, constructs thalamic alignment and
-    crop targets, supplies first-stage label grouping and refinement decisions,
-    gates unsupported target-stage transitions, and postprocesses thalamic
-    output. ``MeshModelPlus`` owns shared geometry, initialization evidence, and
-    hyperparameter mechanics.
+    crop targets, supplies refinement decisions, gates unsupported target-stage
+    transitions, and postprocesses thalamic output. ``MeshModelPlus`` owns
+    shared geometry, configured structural grouping, initialization evidence,
+    and hyperparameter mechanics.
     """
 
     # -------------------------------------------------------------------------
@@ -376,44 +376,11 @@ class ThalamicNucleiPlus(MeshModelPlus):
         refinedSegmentation.labels = self.labelMapping
         return refinedSegmentation
 
-    def get_label_groups(self):
-        """Return the current coarse grouping for first-stage intensity fitting."""
-        labelGroups = [
-            ['Unknown'],
-            ['Left-Cerebral-White-Matter', 'Left-R', 'Right-R'],
-            ['Left-Cerebral-Cortex'],
-            ['Left-Cerebellum-Cortex'],
-            ['Left-Cerebellum-White-Matter'],
-            ['Brain-Stem'],
-            ['Left-Lateral-Ventricle'],
-            ['Left-choroid-plexus'],
-            ['Left-Putamen'],
-            ['Left-Pallidum'],
-            ['Left-Accumbens-area'],
-            ['Left-Caudate'],
-            ['Left-VentralDC', 'Right-VentralDC'],
-        ]
-
-        # The first stage models all bilateral thalamic nuclei together. This
-        # grouping is distinct from the output-reporting whitelist below.
-        thalamicLabels = [
-            'L-Sg', 'LGN', 'MGN', 'PuI', 'PuM', 'H', 'PuL', 'VPI',
-            'PuA', 'MV(Re)', 'Pf', 'CM', 'LP', 'VLa', 'VPL', 'VLp',
-            'MDm', 'VM', 'CeM', 'MDl', 'Pc', 'MDv', 'Pv', 'CL', 'VA',
-            'VPM', 'AV', 'VAmc', 'Pt', 'AD', 'LD',
-        ]
-        labelGroups.append([
-            f'{side}-{label}'
-            for side in ('Left', 'Right')
-            for label in thalamicLabels
-        ])
-        return labelGroups
-
     def get_gaussian_hyps(self, sameGaussianParameters, mesh):
         """Return first-stage hyperparameters from whole-field evidence.
 
-        ``MeshModelPlus`` owns the generic estimator; thalamus contributes the
-        active label grouping and model policy.
+        ``MeshModelPlus`` owns the configured grouping and generic estimator;
+        thalamus contributes the model policy.
 
         Parameters
         ----------

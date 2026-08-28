@@ -1,5 +1,5 @@
 # FreeSurfer 8.2 historical structural thalamus LUT vocabulary.
-+Unknown
+Unknown
 Left-Cerebral-Cortex
 Left-Cerebellum-Cortex
 Left-Cerebral-White-Matter

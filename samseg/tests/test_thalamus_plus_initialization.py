@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 import surfa as sf
 
+from samseg.io import GMMparameter
 from samseg.subregions import core_plus
 from samseg.subregions.core_plus import MeshModelPlus
 from samseg.subregions.model_policy import SubregionModelPolicy
@@ -533,6 +534,83 @@ def test_small_class_erosion_relaxes_or_uses_whole_label_support(supportCase):
     assert strengths[0] == 37.0
 
 
+def test_configured_structural_model_populates_alphas_and_gmm_mean_priors(
+        monkeypatch):
+    """Map configured classes and multichannel mean priors into maintained GMM."""
+    class Mesh:
+        def __init__(self):
+            self.alphas = None
+
+        def rasterize(self, shape):
+            priors = np.empty(tuple(shape) + (3,), dtype='uint16')
+            priors[..., 0] = 20000
+            priors[..., 1] = 20000
+            priors[..., 2] = 25535
+            return priors
+
+    class MeshCollection:
+        def __init__(self):
+            self.mesh = Mesh()
+            self.k = None
+
+        def read(self, fileName):
+            pass
+
+        def transform(self, transform):
+            pass
+
+        def get_mesh(self, meshNumber):
+            assert meshNumber == 0
+            return self.mesh
+
+    expectedMeans = np.array([
+        [10.0, 100.0],
+        [20.0, 200.0],
+    ])
+    expectedStrengths = np.array([12.0, 34.0])
+    model = object.__new__(MeshModelPlus)
+    model.processedImage = _volume(
+        np.ones((2, 2, 2, 2), dtype='float32'))
+    model.crop_image_by_atlas = lambda image: (image.copy(), object())
+    model.warpedMeshFileName = 'unused'
+    model.meshStiffness = 0.05
+    model.modelPolicy = SubregionModelPolicy()
+    model.debug = False
+    model._prepare_intensity_initialization_evidence = lambda priors: None
+    model.FreeSurferLabels = np.array([2, 3, 4])
+    model.classFractions = np.array([
+        [1.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    model.sharedGMMParameters = [
+        GMMparameter('First', 1, ['First']),
+        GMMparameter('Second', 1, ['Second']),
+    ]
+    model.originalAlphas = np.array([[0.2, 0.3, 0.5]])
+    model.get_gaussian_hyps = lambda groups, mesh: (
+        expectedMeans.copy(), expectedStrengths.copy())
+    monkeypatch.setattr(
+        core_plus.gems, 'KvlMeshCollection', MeshCollection)
+
+    model.prepare_for_image_fitting()
+
+    assert model.sameGaussianParameters == [[2, 3], [4]]
+    np.testing.assert_allclose(model.reducedAlphas, [[0.5, 0.5]])
+    np.testing.assert_array_equal(model.reducingLookupTable, [0, 0, 1])
+    np.testing.assert_array_equal(model.gmm.hyperMeans, expectedMeans)
+    np.testing.assert_array_equal(
+        model.gmm.fullHyperMeansNumberOfMeasurements,
+        expectedStrengths)
+    assert model.gmm.numberOfGaussiansPerClass == [1, 1]
+    assert model.gmm.numberOfContrasts == 2
+    assert model.gmm.useDiagonalCovarianceMatrices
+    assert model.gmm.means is None
+    assert model.gmm.variances is None
+    assert model.gmm.mixtureWeights is None
+    assert model.means is None
+    assert model.variances is None
+
+
 def test_regional_em_mask_accepts_finite_negative_and_rejects_missing_channels(
         monkeypatch):
     class Mesh:
@@ -571,10 +649,11 @@ def test_regional_em_mask_accepts_finite_negative_and_rejects_missing_channels(
     model.modelPolicy = SubregionModelPolicy()
     model.debug = False
     model._prepare_intensity_initialization_evidence = lambda priors: None
-    model.get_label_groups = lambda: ['Tissue']
-    model.label_group_names_to_indices = lambda groups: [[0]]
-    model.reduce_alphas = lambda groups: (
-        np.ones((1, 1), dtype='float32'), np.array([0]))
+    model.FreeSurferLabels = np.array([0])
+    model.classFractions = np.ones((1, 1), dtype='float64')
+    model.sharedGMMParameters = [
+        GMMparameter('Tissue', 1, ['Tissue'])]
+    model.originalAlphas = np.ones((1, 1), dtype='float32')
     monkeypatch.setattr(
         core_plus.gems, 'KvlMeshCollection', MeshCollection)
 

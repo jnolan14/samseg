@@ -6,8 +6,11 @@ import numpy as np
 import pytest
 import surfa as sf
 
-from samseg.io import kvlReadSharedGMMParameters
-from samseg.merge_alphas import kvlGetMergingFractionsTable
+from samseg.io import GMMparameter, kvlReadSharedGMMParameters
+from samseg.merge_alphas import (
+    kvlGetMergingFractionsTable,
+    kvlResolveSharedGMMParameters,
+)
 from samseg.subregions.core_plus import MeshModelPlus
 from samseg.subregions.model_policy import SubregionModelPolicy
 from samseg.subregions.thalamus_plus import ThalamicNucleiPlus
@@ -27,6 +30,9 @@ LOCALIZER_LUT_FILES = {
     'synthseg': MODEL_ARTIFACT_DIR / 'SYNTHSEGlocalizerLookupTable.txt',
 }
 POLICY_FILE = MODEL_ARTIFACT_DIR / 'modelPolicy.json'
+STRUCTURAL_PARAMETER_FILE = (
+    MODEL_ARTIFACT_DIR / 'atlas' / 'multiResolutionLevel1'
+    / 'sharedGMMparameters.txt')
 
 # Captured label-name inventories from the historical structural atlas, the
 # installed DTI atlas, and the mature MATLAB DTI atlas. Shared parameters must
@@ -128,6 +134,133 @@ def _load_groups(schema):
     model.preliminaryModelProfileName = schema
     return parameters, model._build_preliminary_localizer_label_groups(
         parameters, lookupTable)
+
+
+def test_shared_gmm_resolution_preserves_sparse_lut_membership_semantics():
+    """Resolve suffixes and singletons without normalizing row overlap."""
+    names = ['Left-VA', 'Left-VAmc', 'Right-VA', 'Other', 'Bridge']
+    parameters = [
+        GMMparameter('ExactVA', 2, ["VA'"]),
+        GMMparameter('LeftFamily', 1, ['Left-']),
+        GMMparameter('Unused', 3, ['Missing']),
+    ]
+
+    resolved, memberships = kvlResolveSharedGMMParameters(
+        names, parameters)
+
+    assert [parameter.mergedName for parameter in resolved] == [
+        'ExactVA', 'LeftFamily', 'Other', 'Bridge']
+    assert [parameter.numberOfComponents for parameter in resolved] == [
+        2, 1, 1, 1]
+    np.testing.assert_array_equal(memberships, [
+        [1, 0, 1, 0, 0],
+        [1, 1, 0, 0, 0],
+        [0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 1],
+    ])
+
+
+def test_merging_fractions_treat_trailing_apostrophe_as_literal_text():
+    """Preserve maintained SAMSEG's substring-only matching contract."""
+    names = ['Left-VA', "Literal-VA'"]
+    parameters = [
+        GMMparameter('Ordinary', 1, ['Left-VA']),
+        GMMparameter('Literal', 1, ["VA'"]),
+    ]
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        fractions, _ = kvlGetMergingFractionsTable(names, parameters)
+
+    np.testing.assert_array_equal(fractions, [
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ])
+
+
+def test_level_one_structural_parameters_reproduce_the_established_partition():
+    """Protect the first-pass model while replacing handwritten grouping."""
+    names = _read_names(ATLAS_LUT_VOCABULARIES[0])
+    model = object.__new__(MeshModelPlus)
+    model.atlasDir = str(STRUCTURAL_PARAMETER_FILE.parent)
+    model.gmmFileName = str(STRUCTURAL_PARAMETER_FILE)
+    model.names = names
+
+    model._configure_shared_gmm_parameters()
+    resolved = model.sharedGMMParameters
+    memberships = model.classFractions.astype(bool)
+
+    expectedSingletons = [
+        'Unknown',
+        'Left-Cerebral-Cortex',
+        'Left-Cerebellum-Cortex',
+        'Left-Cerebellum-White-Matter',
+        'Brain-Stem',
+        'Left-Lateral-Ventricle',
+        'Left-choroid-plexus',
+        'Left-Putamen',
+        'Left-Pallidum',
+        'Left-Accumbens-area',
+        'Left-Caudate',
+    ]
+    assert [parameter.mergedName for parameter in resolved] == [
+        'CerebralWM', 'VentralDC', 'Thalamus', *expectedSingletons]
+    np.testing.assert_array_equal(
+        np.count_nonzero(memberships, axis=0),
+        np.ones(len(names), dtype=int))
+
+    structuresByClass = {
+        parameter.mergedName: {
+            names[structureNumber]
+            for structureNumber in np.flatnonzero(memberships[classNumber])
+        }
+        for classNumber, parameter in enumerate(resolved)
+    }
+    assert structuresByClass['CerebralWM'] == {
+        'Left-Cerebral-White-Matter', 'Left-R', 'Right-R'}
+    assert structuresByClass['VentralDC'] == {
+        'Left-VentralDC', 'Right-VentralDC'}
+    thalamicStructureNames = [
+        'L-Sg', 'LGN', 'MGN', 'PuI', 'PuM', 'H', 'PuL', 'VPI', 'PuA',
+        'MV(Re)', 'Pf', 'CM', 'LP', 'VLa', 'VPL', 'VLp', 'MDm', 'VM',
+        'CeM', 'MDl', 'Pc', 'MDv', 'Pv', 'CL', 'VA', 'VPM', 'AV',
+        'VAmc', 'Pt', 'AD', 'LD',
+    ]
+    expectedThalamicStructures = {
+        f'{side}-{structureName}'
+        for side in ('Left', 'Right')
+        for structureName in thalamicStructureNames
+    }
+    assert structuresByClass['Thalamus'] == (
+        expectedThalamicStructures.intersection(names))
+    for name in expectedSingletons:
+        assert structuresByClass[name] == {name}
+
+
+@pytest.mark.parametrize(
+    ('contents', 'error'),
+    [
+        pytest.param(
+            'First 1 Tissue\nSecond 1 Tissue\n',
+            'multiple parameter rows',
+            id='cross-row-overlap'),
+        pytest.param(
+            'Tissue 2 Tissue\n',
+            'multiple components',
+            id='multi-component-row'),
+    ],
+)
+def test_plus_rejects_structural_models_it_cannot_yet_interpret(
+        tmp_path, contents, error):
+    """Valid general models must fail before unsupported Plus activation."""
+    parameterFile = tmp_path / 'sharedGMMparameters.txt'
+    parameterFile.write_text(contents)
+    model = object.__new__(MeshModelPlus)
+    model.atlasDir = str(tmp_path)
+    model.gmmFileName = str(parameterFile)
+    model.names = ['Tissue']
+
+    with pytest.raises(NotImplementedError, match=error):
+        model._configure_shared_gmm_parameters()
 
 
 @pytest.mark.parametrize('schema', ['aseg', 'synthseg'])

@@ -1,0 +1,10 @@
+# Structural Gaussian grouping for multiResolutionLevel 1 of the
+# FreeSurfer average/ThalamicNuclei/atlas model. This file is paired with that
+# bundle's 66-label compressionLookupTable.txt. Unmatched LUT structures are
+# completed as exact-name one-component singleton classes.
+#
+# The format is: mergedName numberOfComponents searchStrings
+
+CerebralWM 1 Cerebral-White-Matter R'
+VentralDC 1 VentralDC
+Thalamus 1 L-Sg' LGN' MGN' PuI' PuM' H' PuL' VPI' PuA' MV(Re)' Pf' CM' LP' VLa' VPL' VLp' MDm' VM' CeM' MDl' Pc' MDv' Pv' CL' VA' VPM' AV' VAmc' Pt' AD' LD'
