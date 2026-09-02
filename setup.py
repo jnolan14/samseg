@@ -13,6 +13,8 @@ import tempfile
 # Replace build-ext to run CMake in order to build the bindings
 class build_ext_(build_ext):
     def run(self):
+        print("+++++++++++++++++++++++++++\nBEGIN SETUP RUN CALL\n+++++++++++++++++++++++++++\n")
+        print(f"RUNNING ON PLATFORM: {sys.platform}")
         package_root = os.path.abspath(os.path.dirname(__file__))
         # Run CMAKE
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -32,9 +34,11 @@ class build_ext_(build_ext):
                 else:
                     cmake_call += [f'-D{k}={path}']
             print(' '.join(cmake_call))
+            print(f"+++++++++++++++++++++++++++\nCMAKE_CMD: {cmake_call}\n+++++++++++++++++++++++++++\n")
             subprocess.run(cmake_call, check=True)
             # Run Make
             if sys.platform == 'win32':
+                
                 subprocess.run([
                     'cmake', '--build', tmpdir,
                     '--config', 'Release'],
