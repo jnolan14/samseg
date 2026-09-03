@@ -550,7 +550,7 @@ def test_policy_reads_configured_geometry_and_behavior(tmp_path):
         regional_atlas_domain_interior_margin_mm=2.0,
         initial_gmm_covariance_fallback='regional_fitting_covariance',
         maximum_gmm_iterations=37,
-        zero_evidence_initialization={
+        mean_hyperparameter_fallback={
             'strategy': 'fixed',
             'mean': [55.0, 65.0],
             'strength': 7.0,
@@ -567,10 +567,10 @@ def test_policy_reads_configured_geometry_and_behavior(tmp_path):
     assert policy.initialGMMCovarianceFallback == (
         'regional_fitting_covariance')
     assert policy.maximumGMMIterations == 37
-    assert policy.zeroEvidenceInitialization.strategy == 'fixed'
+    assert policy.meanHyperparameterFallback.strategy == 'fixed'
     np.testing.assert_array_equal(
-        policy.zeroEvidenceInitialization.mean, [55.0, 65.0])
-    assert policy.zeroEvidenceInitialization.strength == 7.0
+        policy.meanHyperparameterFallback.mean, [55.0, 65.0])
+    assert policy.meanHyperparameterFallback.strength == 7.0
 
 
 @pytest.mark.parametrize(
@@ -583,7 +583,7 @@ def test_policy_reads_configured_geometry_and_behavior(tmp_path):
         ('initial_gmm_covariance_fallback', {'strategy': 'none'}),
         ('maximum_gmm_iterations', 1),
         ('maximum_gmm_iterations', True),
-        ('zero_evidence_initialization', {'strategy': 'callback'}),
+        ('mean_hyperparameter_fallback', {'strategy': 'callback'}),
     ],
 )
 def test_policy_rejects_invalid_geometry_and_behavior(
@@ -603,7 +603,7 @@ def test_empty_policy_uses_neutral_geometry_and_subject_median_fallback():
     assert policy.localizerAnatomicalSupportMarginInMm == 0.0
     assert policy.preliminaryAtlasDomainInteriorMarginInMm == 0.0
     assert policy.regionalAtlasDomainInteriorMarginInMm == 0.0
-    assert policy.zeroEvidenceInitialization.strategy == (
+    assert policy.meanHyperparameterFallback.strategy == (
         'subject_non_background_median')
     assert policy.initialGMMCovarianceFallback == 'none'
     assert policy.maximumGMMIterations == 100

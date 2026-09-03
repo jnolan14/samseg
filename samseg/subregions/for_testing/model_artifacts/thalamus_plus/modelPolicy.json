@@ -10,7 +10,7 @@
   "regional_atlas_domain_interior_margin_mm": 2.0,
   "initial_gmm_covariance_fallback": "regional_fitting_covariance",
   "maximum_gmm_iterations": 100,
-  "zero_evidence_initialization": {
+  "mean_hyperparameter_fallback": {
     "strategy": "subject_non_background_median",
     "strength": 10.0
   }

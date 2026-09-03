@@ -383,11 +383,11 @@ def test_default_thalamus_policy_defines_profile_memberships_and_initialization_
     assert policy.initialGMMCovarianceFallback == (
         'regional_fitting_covariance')
     assert policy.maximumGMMIterations == 100
-    assert policy.zeroEvidenceInitialization.strategy == (
+    assert policy.meanHyperparameterFallback.strategy == (
         'subject_non_background_median')
-    # Strength 10 belongs to the zero-evidence subject-median fallback, not the
-    # historical fixed VDC strength.
-    assert policy.zeroEvidenceInitialization.strength == 10.0
+    # Strength 10 belongs to the subject-median mean-hyperparameter fallback,
+    # not the historical fixed VDC strength.
+    assert policy.meanHyperparameterFallback.strength == 10.0
 
 
 def test_thalamus_plus_accepts_atlas_override_without_changing_default(

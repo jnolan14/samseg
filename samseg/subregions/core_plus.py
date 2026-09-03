@@ -410,21 +410,9 @@ class MeshModelPlus:
 
     def _apply_affine_target_morphology(self, support):
         """Apply the policy-selected one-voxel affine-target morphology."""
-        morphology = self._ensure_model_policy().affineTargetMorphology
-        if morphology == 'none':
-            return support
-
         structure = utils.spherical_strel(1)
-        if morphology == 'closing':
-            support = scipy.ndimage.binary_dilation(
-                support, structure=structure)
-            return scipy.ndimage.binary_erosion(
-                support, structure=structure, border_value=1)
-
-        support = scipy.ndimage.binary_erosion(
-            support, structure=structure, border_value=1)
-        return scipy.ndimage.binary_dilation(
-            support, structure=structure)
+        return self._ensure_model_policy().apply_affine_target_morphology(
+            support, structure)
 
     # -------------------------------------------------------------------------
     # Shared label and class reduction
@@ -1470,8 +1458,8 @@ class MeshModelPlus:
         The current implementation takes per-channel medians from complete-case
         whole-field class support, prefers an eroded support when sufficient
         samples remain, and expresses support strength in regional-EM-equivalent
-        voxels. Classes without usable support invoke the model policy's
-        explicit zero-evidence strategy.
+        voxels. Classes without usable class-specific observations invoke the
+        model policy's configured mean-hyperparameter fallback.
         """
         if (self.intensityPriorInitializationSegmentation is None
                 or self.intensityPriorInitializationMask is None
@@ -1526,8 +1514,7 @@ class MeshModelPlus:
         emVoxelVolume = np.prod(self.workingImage.geom.voxsize)
         aggregateSupport = validSupport & (labelsImage != 0)
         aggregateObservations = data[aggregateSupport, :]
-        zeroEvidencePolicy = (
-            self._ensure_model_policy().zeroEvidenceInitialization)
+        modelPolicy = self._ensure_model_policy()
 
         # Prefer support eroded by approximately 1 mm in physical space. Small
         # classes progressively relax that erosion before falling back to their
@@ -1554,8 +1541,8 @@ class MeshModelPlus:
                        for candidate in erosionStructures):
                 erosionStructures.append(structure)
 
-        # Select class support, invoking the explicit zero-evidence strategy
-        # only when no usable class-specific observations exist.
+        # Select class support, invoking the mean-hyperparameter fallback only
+        # when no usable class-specific observations exist.
         gaussianOffset = 0
         for classNumber, classLabels in enumerate(sameGaussianParameters):
             numberOfComponents = componentCounts[classNumber]
@@ -1570,14 +1557,14 @@ class MeshModelPlus:
                         'No usable initialization evidence is available to '
                         f'identify the {numberOfComponents} Gaussian '
                         f'components of class {classNumber}')
-                means, strength = zeroEvidencePolicy.initialize(
+                means, strength = modelPolicy.get_fallback_mean_hyperparameters(
                     aggregateObservations, numberOfChannels)
                 meanHyper[gaussianNumbers[0], :] = means
                 nHyper[gaussianNumbers[0]] = strength
                 warnings.warn(
                     'No usable class-specific initialization evidence for '
                     f'class {classNumber} with labels {labels.tolist()}; '
-                    f'using {zeroEvidencePolicy.strategy!r} strategy',
+                    'using configured mean-hyperparameter fallback',
                     RuntimeWarning)
                 continue
 

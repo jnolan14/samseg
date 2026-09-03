@@ -6,8 +6,9 @@ from samseg.GMM import GMM
 from samseg.io import GMMparameter
 from samseg.subregions import core_plus
 from samseg.subregions.core_plus import MeshModelPlus
+from samseg.subregions.model_policy import (
+    MeanHyperparameterFallbackConfiguration)
 from samseg.subregions.model_policy import SubregionModelPolicy
-from samseg.subregions.model_policy import ZeroEvidenceInitializationPolicy
 from samseg.subregions.thalamus_plus import ThalamicNucleiPlus
 
 
@@ -401,7 +402,7 @@ def test_aseg_initialization_requires_no_regional_refinement():
 
 
 def test_multichannel_hyperparameters_use_common_support_and_voxel_volume():
-    """Check first-stage means, volume-scaled strength, and zero evidence."""
+    """Check first-stage means, strength, and missing-class fallback."""
     model = object.__new__(ThalamicNucleiPlus)
     model.intensityPriorImage = _volume(
         np.array([
@@ -433,28 +434,38 @@ def test_multichannel_hyperparameters_use_common_support_and_voxel_volume():
     np.testing.assert_array_equal(strengths, [26, 18, 10])
 
 
-def test_zero_evidence_fixed_strategy_broadcasts_and_checks_channel_shape():
+def test_fixed_mean_hyperparameter_fallback_broadcasts_and_checks_shape():
     # The value 55 is an arbitrary configured fixed-policy fixture, not the
     # default successor rule or a claim about the historical 55/10 fallback.
-    policy = ZeroEvidenceInitializationPolicy(
-        strategy='fixed', mean=55.0, strength=10.0)
+    policy = SubregionModelPolicy(
+        meanHyperparameterFallback=MeanHyperparameterFallbackConfiguration(
+            strategy='fixed', mean=55.0, strength=10.0))
 
-    means, strength = policy.initialize(np.empty((0, 2)), 2)
+    means, strength = policy.get_fallback_mean_hyperparameters(
+        np.empty((0, 2)), 2)
 
     np.testing.assert_array_equal(means, [55.0, 55.0])
     assert strength == 10.0
 
-    incompatible = ZeroEvidenceInitializationPolicy(
-        strategy='fixed', mean=[1.0, 2.0, 3.0], strength=10.0)
+    incompatible = SubregionModelPolicy(
+        meanHyperparameterFallback=MeanHyperparameterFallbackConfiguration(
+            strategy='fixed', mean=[1.0, 2.0, 3.0], strength=10.0))
     with pytest.raises(ValueError, match='broadcast-compatible'):
-        incompatible.initialize(np.empty((0, 2)), 2)
+        incompatible.get_fallback_mean_hyperparameters(
+            np.empty((0, 2)), 2)
 
 
-def test_subject_median_zero_evidence_strategy_fails_without_valid_observations():
-    policy = ZeroEvidenceInitializationPolicy()
+def test_subject_median_mean_hyperparameter_fallback_requires_observations():
+    policy = SubregionModelPolicy()
 
     with pytest.raises(RuntimeError, match='no usable non-background'):
-        policy.initialize(np.empty((0, 2)), 2)
+        policy.get_fallback_mean_hyperparameters(np.empty((0, 2)), 2)
+
+    unsupported = SubregionModelPolicy(
+        meanHyperparameterFallback=MeanHyperparameterFallbackConfiguration(
+            strategy='callback'))
+    with pytest.raises(RuntimeError, match='Unsupported mean-hyperparameter'):
+        unsupported.get_fallback_mean_hyperparameters(np.empty((0, 2)), 2)
 
 
 def test_hyperparameter_support_uses_one_mm_erosion_on_anisotropic_grid():

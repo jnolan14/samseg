@@ -4,50 +4,68 @@ import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
+import scipy.ndimage
 
 # -----------------------------------------------------------------------------
 # Policy decisions
 # -----------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class ZeroEvidenceInitializationPolicy:
-    """Choose hyperparameters when class-specific evidence is unavailable."""
+class MeanHyperparameterFallbackConfiguration:
+    """Configure fallback mean hyperparameters for an unsupported class."""
 
     strategy: str = 'subject_non_background_median'
     strength: float = 10.0
     mean: object = None
 
-    def initialize(self, aggregateObservations, numberOfChannels):
-        """Return fallback means and strength for one unsupported class.
 
-        ``MeshModelPlus`` supplies aggregate observations that already satisfy
-        its multichannel validity and non-background support rules.
-        """
-        if self.strategy == 'subject_non_background_median':
-            observations = np.asarray(aggregateObservations)
-            if observations.ndim != 2 or observations.shape[1] != numberOfChannels:
-                raise ValueError(
-                    'Aggregate zero-evidence observations must be a '
-                    'sample-by-channel array')
-            if observations.shape[0] == 0:
-                raise RuntimeError(
-                    'Cannot initialize an unsupported class because the '
-                    'subject has no usable non-background observations')
-            return np.median(observations, axis=0), self.strength
-
-        if self.strategy == 'fixed':
-            try:
-                mean = np.broadcast_to(
-                    np.asarray(self.mean, dtype='float64'),
-                    (numberOfChannels,)).copy()
-            except ValueError as error:
-                raise ValueError(
-                    'Fixed zero-evidence mean is not broadcast-compatible '
-                    f'with {numberOfChannels} channels') from error
-            return mean, self.strength
-
+def _subject_non_background_median_mean_hyperparameter_fallback(
+        configuration, aggregateObservations, numberOfChannels):
+    """Return subject-median mean hyperparameters for one unsupported class."""
+    observations = np.asarray(aggregateObservations)
+    if (observations.ndim != 2
+            or observations.shape[1] != numberOfChannels):
+        raise ValueError(
+            'Aggregate mean-hyperparameter fallback observations must be a '
+            'sample-by-channel array')
+    if observations.shape[0] == 0:
         raise RuntimeError(
-            f'Unsupported zero-evidence strategy {self.strategy!r}')
+            'Cannot initialize an unsupported class because the subject has '
+            'no usable non-background observations')
+    return np.median(observations, axis=0), configuration.strength
+
+
+def _fixed_mean_hyperparameter_fallback(
+        configuration, _aggregateObservations, numberOfChannels):
+    """Return configured fixed mean hyperparameters for one unsupported class."""
+    try:
+        mean = np.broadcast_to(
+            np.asarray(configuration.mean, dtype='float64'),
+            (numberOfChannels,)).copy()
+    except ValueError as error:
+        raise ValueError(
+            'Fixed mean-hyperparameter fallback is not broadcast-compatible '
+            f'with {numberOfChannels} channels') from error
+    return mean, configuration.strength
+
+
+def _leave_affine_target_unchanged(support, _structure):
+    """Return the affine-alignment target without morphology."""
+    return support
+
+
+def _open_affine_target(support, structure):
+    """Open the affine-alignment target with the supplied structure."""
+    support = scipy.ndimage.binary_erosion(
+        support, structure=structure, border_value=1)
+    return scipy.ndimage.binary_dilation(support, structure=structure)
+
+
+def _close_affine_target(support, structure):
+    """Close the affine-alignment target with the supplied structure."""
+    support = scipy.ndimage.binary_dilation(support, structure=structure)
+    return scipy.ndimage.binary_erosion(
+        support, structure=structure, border_value=1)
 
 
 def _no_initial_gmm_covariance_fallback(_gmm, _observations):
@@ -70,8 +88,20 @@ def _regional_fitting_covariance(gmm, regionalFittingObservations):
     return covariance
 
 
-# Policy artifacts may select only these local implementations. The values are
-# data identifiers, not Python import paths or dynamically resolved callbacks.
+# Policy artifacts may contain only identifiers from the keys below. Each key
+# selects a local implementation, never a Python path or dynamic callback.
+_MEAN_HYPERPARAMETER_FALLBACKS = {
+    'subject_non_background_median': (
+        _subject_non_background_median_mean_hyperparameter_fallback),
+    'fixed': _fixed_mean_hyperparameter_fallback,
+}
+
+_AFFINE_TARGET_MORPHOLOGIES = {
+    'none': _leave_affine_target_unchanged,
+    'opening': _open_affine_target,
+    'closing': _close_affine_target,
+}
+
 _INITIAL_GMM_COVARIANCE_FALLBACKS = {
     'none': _no_initial_gmm_covariance_fallback,
     'regional_fitting_covariance': _regional_fitting_covariance,
@@ -101,8 +131,9 @@ class SubregionModelPolicy:
         Physical inward margin from the preliminary atlas cuboid boundary.
     regionalAtlasDomainInteriorMarginInMm : float
         Physical inward margin from the regional atlas cuboid boundary.
-    zeroEvidenceInitialization : ZeroEvidenceInitializationPolicy
-        Strategy used only when a class has no usable class-specific evidence.
+    meanHyperparameterFallback : MeanHyperparameterFallbackConfiguration
+        Configured fallback used only when a class has no usable
+        class-specific observations for estimating its mean hyperparameters.
     initialGMMCovarianceFallback : {'none', 'regional_fitting_covariance'}
         Strategy used when the first K=1 GMM M-step does not produce a usable
         covariance.
@@ -124,8 +155,8 @@ class SubregionModelPolicy:
     localizerAnatomicalSupportMarginInMm: float = 0.0
     preliminaryAtlasDomainInteriorMarginInMm: float = 0.0
     regionalAtlasDomainInteriorMarginInMm: float = 0.0
-    zeroEvidenceInitialization: ZeroEvidenceInitializationPolicy = field(
-        default_factory=ZeroEvidenceInitializationPolicy)
+    meanHyperparameterFallback: MeanHyperparameterFallbackConfiguration = (
+        field(default_factory=MeanHyperparameterFallbackConfiguration))
     initialGMMCovarianceFallback: str = 'none'
     maximumGMMIterations: int = 100
 
@@ -133,6 +164,30 @@ class SubregionModelPolicy:
         """Return sparse preliminary memberships for one selected profile."""
         return self.preliminaryLocalizerLabelMembershipsByProfile.get(
             profileName, {})
+
+    def get_fallback_mean_hyperparameters(
+            self, aggregateObservations, numberOfChannels):
+        """Return configured mean hyperparameters for an unsupported class."""
+        configuration = self.meanHyperparameterFallback
+        try:
+            fallback = _MEAN_HYPERPARAMETER_FALLBACKS[configuration.strategy]
+        except (KeyError, TypeError) as error:
+            raise RuntimeError(
+                'Unsupported mean-hyperparameter fallback '
+                f'{configuration.strategy!r}') from error
+        return fallback(
+            configuration, aggregateObservations, numberOfChannels)
+
+    def apply_affine_target_morphology(self, support, structure):
+        """Apply the configured morphology to the affine-alignment target."""
+        try:
+            morphology = _AFFINE_TARGET_MORPHOLOGIES[
+                self.affineTargetMorphology]
+        except (KeyError, TypeError) as error:
+            raise RuntimeError(
+                'Unsupported affine-target morphology '
+                f'{self.affineTargetMorphology!r}') from error
+        return morphology(support, structure)
 
     def update_gmm_parameters(self, gmm, data, gaussianPosteriors):
         """Update a GMM while retaining components with weak support."""
@@ -243,7 +298,7 @@ class SubregionModelPolicy:
             'localizer_anatomical_support_margin_mm',
             'preliminary_atlas_domain_interior_margin_mm',
             'regional_atlas_domain_interior_margin_mm',
-            'zero_evidence_initialization',
+            'mean_hyperparameter_fallback',
             'initial_gmm_covariance_fallback',
             'maximum_gmm_iterations',
         }
@@ -298,7 +353,9 @@ class SubregionModelPolicy:
         # Validate lifecycle-wide choices after the membership map is complete.
         affineTargetMorphology = specification.get(
             'affine_target_morphology', 'none')
-        if affineTargetMorphology not in {'opening', 'closing', 'none'}:
+        if (not isinstance(affineTargetMorphology, str)
+                or affineTargetMorphology not in
+                _AFFINE_TARGET_MORPHOLOGIES):
             raise ValueError(
                 'affine_target_morphology must be one of: closing, none, '
                 'opening')
@@ -329,8 +386,8 @@ class SubregionModelPolicy:
                 _read_nonnegative_finite_number(
                     specification,
                     'regional_atlas_domain_interior_margin_mm')),
-            zeroEvidenceInitialization=(
-                _read_zero_evidence_initialization(specification)),
+            meanHyperparameterFallback=(
+                _read_mean_hyperparameter_fallback(specification)),
             initialGMMCovarianceFallback=initialGMMCovarianceFallback,
             maximumGMMIterations=_read_integer_at_least(
                 specification, 'maximum_gmm_iterations', 2, default=100))
@@ -388,23 +445,25 @@ def _read_integer_at_least(specification, fieldName, minimum, default):
     return value
 
 
-def _read_zero_evidence_initialization(specification):
-    """Read the configured zero-evidence strategy and its parameters."""
-    fieldName = 'zero_evidence_initialization'
+def _read_mean_hyperparameter_fallback(specification):
+    """Read the configured fallback strategy and its parameters."""
+    fieldName = 'mean_hyperparameter_fallback'
     value = specification.get(fieldName, {})
     if not isinstance(value, dict):
         raise ValueError(f'{fieldName} must be an object')
 
     strategy = value.get('strategy', 'subject_non_background_median')
-    supportedStrategies = {
+    supportedFieldsByStrategy = {
         'subject_non_background_median': {'strategy', 'strength'},
         'fixed': {'strategy', 'mean', 'strength'},
     }
-    if strategy not in supportedStrategies:
+    if (not isinstance(strategy, str)
+            or strategy not in _MEAN_HYPERPARAMETER_FALLBACKS):
         raise ValueError(
             f'{fieldName}.strategy must be one of: '
-            + ', '.join(sorted(supportedStrategies)))
-    unsupportedFields = sorted(set(value) - supportedStrategies[strategy])
+            + ', '.join(sorted(_MEAN_HYPERPARAMETER_FALLBACKS)))
+    unsupportedFields = sorted(
+        set(value) - supportedFieldsByStrategy[strategy])
     if unsupportedFields:
         raise ValueError(
             f'Unsupported {fieldName} fields for {strategy!r}: '
@@ -423,5 +482,5 @@ def _read_zero_evidence_initialization(specification):
             raise ValueError(
                 f'{fieldName}.mean must be a finite scalar or vector')
 
-    return ZeroEvidenceInitializationPolicy(
+    return MeanHyperparameterFallbackConfiguration(
         strategy=strategy, strength=strength, mean=mean)
