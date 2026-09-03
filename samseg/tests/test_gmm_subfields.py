@@ -118,6 +118,72 @@ def test_diagonal_mode_projects_the_same_covariance_update():
     assert not np.isclose(full.variances[0, 0, 1], 0.0)
 
 
+def test_prior_evaluator_supports_exact_zero_scale_at_minimum_h():
+    covariance = np.array([[2.0, 0.4], [0.4, 1.5]])
+    mean = np.array([1.5, -0.5])
+    hyper_mean = np.array([0.5, 0.25])
+    mean_strength = 3.0
+    h = 4.0
+    gmm = GMM(
+        [1], 2,
+        initialMeans=mean[None, :],
+        initialVariances=covariance[None, ...],
+        initialMixtureWeights=np.ones(1),
+        initialHyperMeans=hyper_mean[None, :],
+        initialHyperMeansNumberOfMeasurements=np.array([mean_strength]),
+        initialHyperVariances=np.zeros((1, 2, 2)),
+        initialHyperVariancesNumberOfMeasurements=np.array([h]))
+
+    chol = np.linalg.cholesky(covariance)
+    half_log_determinant = np.sum(np.log(np.diag(chol)))
+    transformed = np.linalg.solve(chol, mean - hyper_mean)
+    mean_term = mean_strength * np.sum(transformed * transformed) / 2
+    expected = mean_term + (h + 1) * half_log_determinant
+    coherent_without_historical_extra = mean_term + h * half_log_determinant
+
+    result = gmm.evaluateMinLogPriorOfGMMParameters()
+
+    assert np.isfinite(result)
+    np.testing.assert_allclose(result, expected)
+    assert not np.isclose(result, coherent_without_historical_extra)
+
+
+def test_prior_evaluator_preserves_positive_scale_result_exactly():
+    covariance = np.array([[2.0, 0.4], [0.4, 1.5]])
+    hyper_variance = np.array([[0.75, 0.1], [0.1, 1.25]])
+    mean = np.array([1.5, -0.5])
+    hyper_mean = np.array([0.5, 0.25])
+    mean_strength = 3.0
+    h = 5.0
+    gmm = GMM(
+        [1], 2,
+        initialMeans=mean[None, :],
+        initialVariances=covariance[None, ...],
+        initialMixtureWeights=np.ones(1),
+        initialHyperMeans=hyper_mean[None, :],
+        initialHyperMeansNumberOfMeasurements=np.array([mean_strength]),
+        initialHyperVariances=hyper_variance[None, ...],
+        initialHyperVariancesNumberOfMeasurements=np.array([h]))
+
+    chol = np.linalg.cholesky(covariance)
+    half_log_determinant = np.sum(np.log(np.diag(chol)))
+    transformed = np.linalg.solve(chol, mean - hyper_mean)
+    expected = (
+        np.sum(transformed * transformed) * mean_strength / 2
+        + half_log_determinant)
+    hyper_chol = np.linalg.cholesky(hyper_variance)
+    half_log_hyper_determinant = np.sum(np.log(np.diag(hyper_chol)))
+    transformed_hyper = np.linalg.solve(chol, hyper_chol)
+    expected += (
+        np.trace(transformed_hyper @ transformed_hyper.T) * h / 2
+        + h * half_log_determinant
+        - (h - gmm.numberOfContrasts - 2) * half_log_hyper_determinant)
+
+    result = gmm.evaluateMinLogPriorOfGMMParameters()
+
+    assert result == expected
+
+
 def test_multiple_components_produce_responsibilities_and_fitted_weights():
     data = np.array([[0.0], [1.0], [4.0], [5.0]])
     class_priors = np.ones((4, 1))

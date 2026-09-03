@@ -1,5 +1,6 @@
 import json
 import math
+import warnings
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -49,6 +50,34 @@ class ZeroEvidenceInitializationPolicy:
             f'Unsupported zero-evidence strategy {self.strategy!r}')
 
 
+def _no_initial_gmm_covariance_fallback(_gmm, _observations):
+    """Decline to replace an unusable first-state covariance."""
+    return None
+
+
+def _regional_fitting_covariance(gmm, regionalFittingObservations):
+    """Pool the observations already selected by the regional fitting mask."""
+    observations = np.asarray(
+        regionalFittingObservations, dtype='float64')
+    if (observations.ndim != 2
+            or observations.shape[1] != gmm.numberOfContrasts
+            or len(observations) < 2):
+        return None
+    covariance = np.atleast_2d(
+        np.cov(observations, rowvar=False, ddof=1))
+    if gmm.useDiagonalCovarianceMatrices:
+        covariance = np.diag(np.diag(covariance))
+    return covariance
+
+
+# Policy artifacts may select only these local implementations. The values are
+# data identifiers, not Python import paths or dynamically resolved callbacks.
+_INITIAL_GMM_COVARIANCE_FALLBACKS = {
+    'none': _no_initial_gmm_covariance_fallback,
+    'regional_fitting_covariance': _regional_fitting_covariance,
+}
+
+
 @dataclass(frozen=True)
 class SubregionModelPolicy:
     """Typed model-specific decisions used by the shared subregion lifecycle.
@@ -74,6 +103,12 @@ class SubregionModelPolicy:
         Physical inward margin from the regional atlas cuboid boundary.
     zeroEvidenceInitialization : ZeroEvidenceInitializationPolicy
         Strategy used only when a class has no usable class-specific evidence.
+    initialGMMCovarianceFallback : {'none', 'regional_fitting_covariance'}
+        Strategy used when the first K=1 GMM M-step does not produce a usable
+        covariance.
+    maximumGMMIterations : int
+        Maximum number of completed GMM M-steps per outer mesh iteration.
+        Reaching this work ceiling is distinct from convergence.
 
     Notes
     -----
@@ -91,11 +126,95 @@ class SubregionModelPolicy:
     regionalAtlasDomainInteriorMarginInMm: float = 0.0
     zeroEvidenceInitialization: ZeroEvidenceInitializationPolicy = field(
         default_factory=ZeroEvidenceInitializationPolicy)
+    initialGMMCovarianceFallback: str = 'none'
+    maximumGMMIterations: int = 100
 
     def get_preliminary_localizer_label_memberships(self, profileName):
         """Return sparse preliminary memberships for one selected profile."""
         return self.preliminaryLocalizerLabelMembershipsByProfile.get(
             profileName, {})
+
+    def update_gmm_parameters(self, gmm, data, gaussianPosteriors):
+        """Update a GMM while retaining components with weak support."""
+        if gmm.tied:
+            raise NotImplementedError(
+                'Plus low-support retention does not support tied Gaussians')
+
+        masses = np.sum(gaussianPosteriors, axis=0)
+        weak = masses <= 1e-2
+        previousMeans = gmm.means.copy()
+        previousVariances = gmm.variances.copy()
+        previousWeights = gmm.mixtureWeights.copy()
+
+        gmm.fitGMMParameters(data, gaussianPosteriors)
+        unusable = np.array([
+            not np.all(np.isfinite(gmm.means[gaussianNumber]))
+            or not _covariance_is_usable(covariance)
+            for gaussianNumber, covariance in enumerate(gmm.variances)
+        ])
+        retained = weak | unusable
+        gmm.means[retained] = previousMeans[retained]
+        gmm.variances[retained] = previousVariances[retained]
+        if np.any(unusable & ~weak):
+            warnings.warn(
+                'Retaining last valid GMM state after an unusable numerical '
+                'update', RuntimeWarning)
+
+        gaussianOffset = 0
+        for numberOfComponents in gmm.numberOfGaussiansPerClass:
+            gaussianSlice = slice(
+                gaussianOffset, gaussianOffset + numberOfComponents)
+            gaussianOffset += numberOfComponents
+            classRetained = retained[gaussianSlice]
+            if not np.any(classRetained):
+                continue
+            if np.all(classRetained):
+                gmm.mixtureWeights[gaussianSlice] = (
+                    previousWeights[gaussianSlice])
+                continue
+
+            updatedWeights = gmm.mixtureWeights[gaussianSlice].copy()
+            retainedWeights = previousWeights[gaussianSlice][classRetained]
+            residual = 1.0 - np.sum(retainedWeights)
+            activeTotal = np.sum(updatedWeights[~classRetained])
+            if (residual <= 0
+                    or activeTotal <= 0
+                    or not np.isfinite(activeTotal)):
+                raise RuntimeError(
+                    'Cannot normalize active mixture weights around retained '
+                    'low-support components')
+            updatedWeights[classRetained] = retainedWeights
+            updatedWeights[~classRetained] *= residual / activeTotal
+            gmm.mixtureWeights[gaussianSlice] = updatedWeights
+
+    def get_initial_gmm_fallback_covariance(
+            self, gmm, regionalFittingObservations):
+        """Delegate the configured first-state K=1 covariance behavior."""
+        try:
+            fallback = _INITIAL_GMM_COVARIANCE_FALLBACKS[
+                self.initialGMMCovarianceFallback]
+        except (KeyError, TypeError) as error:
+            raise RuntimeError(
+                'Unsupported initial GMM covariance fallback '
+                f'{self.initialGMMCovarianceFallback!r}') from error
+        return fallback(gmm, regionalFittingObservations)
+
+    def has_gmm_converged(
+            self, previousObjective, currentObjective, completedIterations):
+        """Return whether the configured structural GMM has converged."""
+        if (not np.isfinite(previousObjective)
+                or not np.isfinite(currentObjective)
+                or currentObjective == 0):
+            raise RuntimeError(
+                'Structural GMM relative objective improvement is not finite')
+        if completedIterations < 2:
+            return False
+        relativeImprovement = (
+            (previousObjective - currentObjective) / abs(currentObjective))
+        if not np.isfinite(relativeImprovement):
+            raise RuntimeError(
+                'Structural GMM relative objective improvement is not finite')
+        return relativeImprovement <= 1e-5
 
     @classmethod
     def read(cls, fileName):
@@ -125,6 +244,8 @@ class SubregionModelPolicy:
             'preliminary_atlas_domain_interior_margin_mm',
             'regional_atlas_domain_interior_margin_mm',
             'zero_evidence_initialization',
+            'initial_gmm_covariance_fallback',
+            'maximum_gmm_iterations',
         }
         unsupportedFields = sorted(set(specification) - supportedFields)
         if unsupportedFields:
@@ -182,6 +303,16 @@ class SubregionModelPolicy:
                 'affine_target_morphology must be one of: closing, none, '
                 'opening')
 
+        initialGMMCovarianceFallback = specification.get(
+            'initial_gmm_covariance_fallback', 'none')
+        if (not isinstance(initialGMMCovarianceFallback, str)
+                or initialGMMCovarianceFallback not in
+                _INITIAL_GMM_COVARIANCE_FALLBACKS):
+            raise ValueError(
+                'initial_gmm_covariance_fallback must be one of: '
+                + ', '.join(sorted(
+                    _INITIAL_GMM_COVARIANCE_FALLBACKS)))
+
         return cls(
             preliminaryLocalizerLabelMembershipsByProfile=(
                 validatedMembershipsByProfile),
@@ -199,7 +330,10 @@ class SubregionModelPolicy:
                     specification,
                     'regional_atlas_domain_interior_margin_mm')),
             zeroEvidenceInitialization=(
-                _read_zero_evidence_initialization(specification)))
+                _read_zero_evidence_initialization(specification)),
+            initialGMMCovarianceFallback=initialGMMCovarianceFallback,
+            maximumGMMIterations=_read_integer_at_least(
+                specification, 'maximum_gmm_iterations', 2, default=100))
 
 
 # -----------------------------------------------------------------------------
@@ -220,6 +354,17 @@ def _read_nonnegative_integers(values, fieldName):
     return tuple(values)
 
 
+def _covariance_is_usable(covariance):
+    """Return whether a covariance is finite and positive definite."""
+    if not np.all(np.isfinite(covariance)):
+        return False
+    try:
+        np.linalg.cholesky(covariance)
+    except np.linalg.LinAlgError:
+        return False
+    return True
+
+
 def _read_nonnegative_finite_number(specification, fieldName, default=0.0):
     """Return one finite nonnegative numeric policy value."""
     value = specification.get(fieldName, default)
@@ -229,6 +374,18 @@ def _read_nonnegative_finite_number(specification, fieldName, default=0.0):
             or value < 0):
         raise ValueError(f'{fieldName} must be a finite nonnegative number')
     return float(value)
+
+
+def _read_integer_at_least(specification, fieldName, minimum, default):
+    """Return one integer policy value no smaller than ``minimum``."""
+    value = specification.get(fieldName, default)
+    if (isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < minimum):
+        raise ValueError(
+            f'{fieldName} must be an integer greater than or equal to '
+            f'{minimum}')
+    return value
 
 
 def _read_zero_evidence_initialization(specification):

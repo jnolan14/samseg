@@ -236,31 +236,32 @@ def test_level_one_structural_parameters_reproduce_the_established_partition():
         assert structuresByClass[name] == {name}
 
 
-@pytest.mark.parametrize(
-    ('contents', 'error'),
-    [
-        pytest.param(
-            'First 1 Tissue\nSecond 1 Tissue\n',
-            'multiple parameter rows',
-            id='cross-row-overlap'),
-        pytest.param(
-            'Tissue 2 Tissue\n',
-            'multiple components',
-            id='multi-component-row'),
-    ],
-)
 def test_plus_rejects_structural_models_it_cannot_yet_interpret(
-        tmp_path, contents, error):
-    """Valid general models must fail before unsupported Plus activation."""
+        tmp_path):
+    """Cross-row overlap must fail before unsupported Plus activation."""
     parameterFile = tmp_path / 'sharedGMMparameters.txt'
-    parameterFile.write_text(contents)
+    parameterFile.write_text('First 1 Tissue\nSecond 1 Tissue\n')
     model = object.__new__(MeshModelPlus)
     model.atlasDir = str(tmp_path)
     model.gmmFileName = str(parameterFile)
     model.names = ['Tissue']
 
-    with pytest.raises(NotImplementedError, match=error):
+    with pytest.raises(NotImplementedError, match='multiple parameter rows'):
         model._configure_shared_gmm_parameters()
+
+
+def test_plus_accepts_disjoint_multicomponent_structural_class(tmp_path):
+    parameterFile = tmp_path / 'sharedGMMparameters.txt'
+    parameterFile.write_text('Tissue 2 Tissue\n')
+    model = object.__new__(MeshModelPlus)
+    model.atlasDir = str(tmp_path)
+    model.gmmFileName = str(parameterFile)
+    model.names = ['Tissue']
+
+    model._configure_shared_gmm_parameters()
+
+    assert model.sharedGMMParameters[0].numberOfComponents == 2
+    np.testing.assert_array_equal(model.classFractions, [[1.0]])
 
 
 @pytest.mark.parametrize('schema', ['aseg', 'synthseg'])
@@ -379,6 +380,9 @@ def test_default_thalamus_policy_defines_profile_memberships_and_initialization_
     assert policy.localizerAnatomicalSupportMarginInMm == 1.5
     assert policy.preliminaryAtlasDomainInteriorMarginInMm == 3.0
     assert policy.regionalAtlasDomainInteriorMarginInMm == 2.0
+    assert policy.initialGMMCovarianceFallback == (
+        'regional_fitting_covariance')
+    assert policy.maximumGMMIterations == 100
     assert policy.zeroEvidenceInitialization.strategy == (
         'subject_non_background_median')
     # Strength 10 belongs to the zero-evidence subject-median fallback, not the

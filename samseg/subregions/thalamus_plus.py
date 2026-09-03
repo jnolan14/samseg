@@ -66,10 +66,6 @@ class ThalamicNucleiPlus(MeshModelPlus):
         }
         self.inputSegmentationSchemaOverride = inputSegmentationSchema
 
-        # Preserve the two-stage boundary; the unsupported target transition
-        # fails closed through the explicit extension methods below.
-        self.useTwoComponents = True
-
         # Segmentation mesh-fitting parameters
         self.cheatingMeshSmoothingSigmas = [3.0, 2.0]
         self.cheatingMaxIterations = [300, 150]
@@ -393,9 +389,9 @@ class ThalamicNucleiPlus(MeshModelPlus):
         Returns
         -------
         meanHyper : numpy.ndarray
-            Class-by-channel prior means.
+            Gaussian-component-by-channel prior means.
         nHyper : numpy.ndarray
-            Effective prior sample count for each class.
+            Effective prior sample count for each Gaussian component.
         """
         return self._estimate_intensity_hyperparameters(
             sameGaussianParameters)

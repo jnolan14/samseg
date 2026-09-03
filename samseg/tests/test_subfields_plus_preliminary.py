@@ -540,7 +540,7 @@ def test_policy_rejects_invalid_physical_margin(tmp_path, margin):
         SubregionModelPolicy.read(policyFile)
 
 
-def test_policy_reads_morphology_margins_and_zero_evidence_settings(tmp_path):
+def test_policy_reads_configured_geometry_and_behavior(tmp_path):
     policyFile = tmp_path / 'modelPolicy.json'
     _write_policy(
         policyFile,
@@ -548,6 +548,8 @@ def test_policy_reads_morphology_margins_and_zero_evidence_settings(tmp_path):
         localizer_anatomical_support_margin_mm=1.5,
         preliminary_atlas_domain_interior_margin_mm=3.0,
         regional_atlas_domain_interior_margin_mm=2.0,
+        initial_gmm_covariance_fallback='regional_fitting_covariance',
+        maximum_gmm_iterations=37,
         zero_evidence_initialization={
             'strategy': 'fixed',
             'mean': [55.0, 65.0],
@@ -562,6 +564,9 @@ def test_policy_reads_morphology_margins_and_zero_evidence_settings(tmp_path):
     assert policy.localizerAnatomicalSupportMarginInMm == 1.5
     assert policy.preliminaryAtlasDomainInteriorMarginInMm == 3.0
     assert policy.regionalAtlasDomainInteriorMarginInMm == 2.0
+    assert policy.initialGMMCovarianceFallback == (
+        'regional_fitting_covariance')
+    assert policy.maximumGMMIterations == 37
     assert policy.zeroEvidenceInitialization.strategy == 'fixed'
     np.testing.assert_array_equal(
         policy.zeroEvidenceInitialization.mean, [55.0, 65.0])
@@ -574,10 +579,14 @@ def test_policy_reads_morphology_margins_and_zero_evidence_settings(tmp_path):
         ('affine_target_morphology', 'blur'),
         ('preliminary_atlas_domain_interior_margin_mm', -1),
         ('regional_atlas_domain_interior_margin_mm', True),
+        ('initial_gmm_covariance_fallback', 'package.module:callable'),
+        ('initial_gmm_covariance_fallback', {'strategy': 'none'}),
+        ('maximum_gmm_iterations', 1),
+        ('maximum_gmm_iterations', True),
         ('zero_evidence_initialization', {'strategy': 'callback'}),
     ],
 )
-def test_policy_rejects_invalid_morphology_margins_and_zero_evidence_strategy(
+def test_policy_rejects_invalid_geometry_and_behavior(
         tmp_path, field, value):
     policyFile = tmp_path / 'modelPolicy.json'
     _write_policy(policyFile, **{field: value})
@@ -596,7 +605,22 @@ def test_empty_policy_uses_neutral_geometry_and_subject_median_fallback():
     assert policy.regionalAtlasDomainInteriorMarginInMm == 0.0
     assert policy.zeroEvidenceInitialization.strategy == (
         'subject_non_background_median')
+    assert policy.initialGMMCovarianceFallback == 'none'
+    assert policy.maximumGMMIterations == 100
     assert policy.get_preliminary_localizer_label_memberships('aseg') == {}
+
+
+def test_policy_decides_structural_gmm_convergence():
+    policy = SubregionModelPolicy()
+
+    assert not policy.has_gmm_converged(10.0, 10.0, 1)
+    assert not policy.has_gmm_converged(10.0002, 10.0, 2)
+    assert policy.has_gmm_converged(10.00005, 10.0, 2)
+    assert policy.has_gmm_converged(10.0, 11.0, 2)
+    with pytest.raises(RuntimeError, match='not finite'):
+        policy.has_gmm_converged(np.nan, 10.0, 2)
+    with pytest.raises(RuntimeError, match='not finite'):
+        policy.has_gmm_converged(10.0, 0.0, 2)
 
 
 @pytest.mark.parametrize(

@@ -301,12 +301,23 @@ class GMM:
             # -log IW( variance | hyperVariance * hyperVarianceNumberOfMeasurements,
             #                     hyperVarianceNumberOfMeasurements - numberOfContrasts - 2 )
             #
-            hyperL = np.linalg.cholesky(hyperVariance)  # hyperVariance = hyperL @ hyperL.T
-            halfOfLogDetHyperVariance = np.sum(np.log(np.diag(hyperL)))
-            tmp = np.linalg.solve(L, hyperL)
-            minLogPrior += np.trace(tmp @ tmp.T) * hyperVarianceNumberOfMeasurements / 2 + \
-                           hyperVarianceNumberOfMeasurements * halfOfLogDetVariance - \
-                           (hyperVarianceNumberOfMeasurements - self.numberOfContrasts - 2) * halfOfLogDetHyperVariance
+            # Mature subregion models use the exact limiting case H=0 and
+            # h=D+2. Its trace term is zero and the coefficient of log|H| is
+            # zero, so H need not be factorized. Retain this evaluator's
+            # established contribution involving log|variance|.
+            if (np.all(hyperVariance == 0)
+                    and hyperVarianceNumberOfMeasurements
+                    - self.numberOfContrasts - 2 == 0):
+                minLogPrior += (
+                    hyperVarianceNumberOfMeasurements
+                    * halfOfLogDetVariance)
+            else:
+                hyperL = np.linalg.cholesky(hyperVariance)  # hyperVariance = hyperL @ hyperL.T
+                halfOfLogDetHyperVariance = np.sum(np.log(np.diag(hyperL)))
+                tmp = np.linalg.solve(L, hyperL)
+                minLogPrior += np.trace(tmp @ tmp.T) * hyperVarianceNumberOfMeasurements / 2 + \
+                               hyperVarianceNumberOfMeasurements * halfOfLogDetVariance - \
+                               (hyperVarianceNumberOfMeasurements - self.numberOfContrasts - 2) * halfOfLogDetHyperVariance
 
         for classNumber in range(self.numberOfClasses):
             # -log Dir( weights | hyperMixtureWeights * hyperMixtureWeightNumberOfMeasurements + 1 )

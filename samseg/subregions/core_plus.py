@@ -6,6 +6,7 @@ import warnings
 import numpy as np
 import surfa as sf
 import scipy.ndimage
+from sklearn.cluster import KMeans
 from samseg import gems
 from samseg.GMM import GMM
 from samseg.io import kvlReadSharedGMMParameters
@@ -57,6 +58,7 @@ class MeshModelPlus:
         debug=False,
         preliminarySharedGMMParametersFileName=None,
         gmmFileName=None,
+        useDiagonalCovarianceMatrices=False,
         ):
         """Initialize shared lifecycle state and region-configurable defaults."""
 
@@ -71,6 +73,7 @@ class MeshModelPlus:
         self.preliminarySharedGMMParametersFileName = (
             preliminarySharedGMMParametersFileName)
         self.gmmFileName = gmmFileName
+        self.useDiagonalCovarianceMatrices = useDiagonalCovarianceMatrices
         self.preliminaryModelProfileName = None
         self.preliminaryLocalizerLookupTableFileName = None
         self.modelPolicyFileName = None
@@ -134,6 +137,24 @@ class MeshModelPlus:
         self.longMaxIterations = [[6, 3], [2, 1]]
         self.maxGlobalLongIterations = 2
         self.longMask = None
+
+    @property
+    def means(self):
+        """Expose the Gaussian-component means owned by the configured GMM."""
+        return self.gmm.means
+
+    @means.setter
+    def means(self, value):
+        self.gmm.means = value
+
+    @property
+    def variances(self):
+        """Expose the covariance matrices owned by the configured GMM."""
+        return self.gmm.variances
+
+    @variances.setter
+    def variances(self, value):
+        self.gmm.variances = value
 
     def cleanup(self):
         """
@@ -226,10 +247,6 @@ class MeshModelPlus:
         if np.any(componentCounts <= 0):
             raise ValueError(
                 'Structural shared-GMM component counts must be positive')
-        if np.any(componentCounts > 1):
-            raise NotImplementedError(
-                'Plus structural GMM initialization does not yet support '
-                'shared-parameter rows with multiple components')
         if np.any(np.count_nonzero(memberships, axis=0) > 1):
             raise NotImplementedError(
                 'Plus structural GMM initialization does not yet support '
@@ -1482,10 +1499,25 @@ class MeshModelPlus:
         # Establish common observation support and voxel-volume scaling.
         data = np.asarray(self.intensityPriorImage.framed_data)
         numberOfChannels = data.shape[-1]
+        componentCounts = (
+            [parameter.numberOfComponents
+             for parameter in self.sharedGMMParameters]
+            if getattr(self, 'sharedGMMParameters', None) is not None
+            else [1] * len(sameGaussianParameters))
+        if len(componentCounts) != len(sameGaussianParameters):
+            raise RuntimeError(
+                'Configured component counts do not align with the resolved '
+                'structural classes')
+        numberOfGaussians = int(np.sum(componentCounts))
         meanHyper = np.empty(
-            (len(sameGaussianParameters), numberOfChannels),
+            (numberOfGaussians, numberOfChannels), dtype='float64')
+        nHyper = np.empty(numberOfGaussians, dtype='float64')
+        initializationVariances = np.full(
+            (numberOfGaussians, numberOfChannels, numberOfChannels),
+            np.nan,
             dtype='float64')
-        nHyper = np.empty(len(sameGaussianParameters), dtype='float64')
+        initializationMeans = np.full(
+            (numberOfGaussians, numberOfChannels), np.nan, dtype='float64')
         labelsImage = self.intensityPriorInitializationSegmentation.data
         validSupport = self.intensityPriorInitializationMask.data > 0
         validSupport &= np.all(np.isfinite(data) & (data != 0), axis=-1)
@@ -1524,14 +1556,24 @@ class MeshModelPlus:
 
         # Select class support, invoking the explicit zero-evidence strategy
         # only when no usable class-specific observations exist.
+        gaussianOffset = 0
         for classNumber, classLabels in enumerate(sameGaussianParameters):
+            numberOfComponents = componentCounts[classNumber]
+            gaussianNumbers = np.arange(
+                gaussianOffset, gaussianOffset + numberOfComponents)
+            gaussianOffset += numberOfComponents
             labels = np.asarray(classLabels)
             unErodedSupport = np.isin(labelsImage, labels) & validSupport
             if not np.any(unErodedSupport):
+                if numberOfComponents > 1:
+                    raise RuntimeError(
+                        'No usable initialization evidence is available to '
+                        f'identify the {numberOfComponents} Gaussian '
+                        f'components of class {classNumber}')
                 means, strength = zeroEvidencePolicy.initialize(
                     aggregateObservations, numberOfChannels)
-                meanHyper[classNumber, :] = means
-                nHyper[classNumber] = strength
+                meanHyper[gaussianNumbers[0], :] = means
+                nHyper[gaussianNumbers[0]] = strength
                 warnings.warn(
                     'No usable class-specific initialization evidence for '
                     f'class {classNumber} with labels {labels.tolist()}; '
@@ -1552,12 +1594,85 @@ class MeshModelPlus:
                 statisticsSupport = unErodedSupport
 
             observations = data[statisticsSupport, :]
-            meanHyper[classNumber, :] = np.median(observations, axis=0)
-            nHyper[classNumber] = (
-                10
-                + len(observations)
-                * priorVoxelVolume
-                / emVoxelVolume)
+            strengthScale = priorVoxelVolume / emVoxelVolume
+            if numberOfComponents == 1:
+                meanHyper[gaussianNumbers[0], :] = np.median(
+                    observations, axis=0)
+                nHyper[gaussianNumbers[0]] = (
+                    10 + len(observations) * strengthScale)
+                continue
+
+            if (len(observations) < numberOfComponents
+                    or len(np.unique(observations, axis=0))
+                    < numberOfComponents):
+                raise RuntimeError(
+                    'Initialization observations do not identify all '
+                    f'{numberOfComponents} Gaussian components of class '
+                    f'{classNumber}')
+
+            # The configured component slots are exchangeable for the
+            # currently supported disjoint classes. Use the same maintained,
+            # deterministic Euclidean clustering as the SynthSeg refinement;
+            # mature L1 and overlap-informed assignment remain later work.
+            clustering = KMeans(
+                n_clusters=numberOfComponents,
+                random_state=0,
+                n_init=10)
+            assignments = clustering.fit_predict(observations)
+            centers = clustering.cluster_centers_
+            if (not np.all(np.isfinite(centers))
+                    or np.any(np.bincount(
+                        assignments, minlength=numberOfComponents) == 0)):
+                raise RuntimeError(
+                    'Initialization observations do not identify all '
+                    f'{numberOfComponents} Gaussian components of class '
+                    f'{classNumber}')
+
+            # Give the otherwise anonymous components a deterministic order.
+            order = np.lexsort(tuple(
+                centers[:, axis]
+                for axis in reversed(range(centers.shape[1]))))
+            inverseOrder = np.empty_like(order)
+            inverseOrder[order] = np.arange(numberOfComponents)
+            centers = centers[order]
+            assignments = inverseOrder[assignments]
+            for componentNumber, gaussianNumber in enumerate(gaussianNumbers):
+                componentObservations = observations[
+                    assignments == componentNumber]
+                meanHyper[gaussianNumber, :] = centers[componentNumber]
+                nHyper[gaussianNumber] = (
+                    len(componentObservations) * strengthScale)
+
+                # This finite state is used only to subdivide the already
+                # rasterized class prior before the first authoritative M-step.
+                componentWeight = 1 / numberOfComponents
+                effectiveMass = len(componentObservations) * componentWeight
+                currentMean = (
+                    componentWeight * np.sum(componentObservations, axis=0)
+                    + nHyper[gaussianNumber] * centers[componentNumber]
+                ) / (effectiveMass + nHyper[gaussianNumber])
+                differences = componentObservations - currentMean
+                covariance = (
+                    componentWeight * differences.T @ differences
+                    + nHyper[gaussianNumber]
+                    * np.outer(
+                        currentMean - centers[componentNumber],
+                        currentMean - centers[componentNumber])
+                ) / (effectiveMass + numberOfChannels + 2)
+                if self.useDiagonalCovarianceMatrices:
+                    covariance = np.diag(np.diag(covariance))
+                try:
+                    np.linalg.cholesky(covariance)
+                except np.linalg.LinAlgError as error:
+                    raise RuntimeError(
+                        'Initialization evidence did not produce a finite '
+                        f'positive-definite covariance for class {classNumber}, '
+                        f'component {componentNumber}') from error
+                initializationMeans[gaussianNumber] = currentMean
+                initializationVariances[gaussianNumber] = covariance
+
+        self._initializationGaussianMeans = initializationMeans
+        self._initializationGaussianVariances = initializationVariances
 
         return meanHyper, nHyper
 
@@ -1633,8 +1748,10 @@ class MeshModelPlus:
 
         self._prepare_intensity_initialization_evidence(fullPriors)
 
-        # Materialize the supported one-hot structural model for the copied
-        # categorical-evidence and fitting consumers that remain authoritative.
+        # Materialize the supported one-hot structural model. The hard label
+        # groups remain the input to the fitted initialization evidence, while
+        # classFractions is the maintained-SAMSEG map used for alpha merging and
+        # final structure posteriors.
         FreeSurferLabels = np.asarray(self.FreeSurferLabels)
         self.sameGaussianParameters = [
             FreeSurferLabels[fractions > 0].tolist()
@@ -1642,8 +1759,6 @@ class MeshModelPlus:
         ]
         self.reducedAlphas = kvlMergeAlphas(
             self.originalAlphas, self.classFractions)
-        self.reducingLookupTable = np.argmax(
-            self.classFractions, axis=0)
         self.mesh.alphas = self.reducedAlphas
 
         self.gmm = None
@@ -1652,72 +1767,218 @@ class MeshModelPlus:
             self.meanHyper, self.nHyper = self.get_gaussian_hyps(
                 self.sameGaussianParameters,
                 self.mesh)
+            componentCounts = [
+                parameter.numberOfComponents
+                for parameter in self.sharedGMMParameters]
+            numberOfGaussians = int(np.sum(componentCounts))
+            numberOfChannels = self.meanHyper.shape[1]
+            hyperMixtureWeights = np.empty(
+                numberOfGaussians, dtype='float64')
+            gaussianOffset = 0
+            for numberOfComponents in componentCounts:
+                hyperMixtureWeights[
+                    gaussianOffset:gaussianOffset + numberOfComponents
+                ] = 1 / numberOfComponents
+                gaussianOffset += numberOfComponents
             self.gmm = GMM(
-                [parameter.numberOfComponents
-                 for parameter in self.sharedGMMParameters],
-                numberOfContrasts=self.meanHyper.shape[1],
-                useDiagonalCovarianceMatrices=True,
+                componentCounts,
+                numberOfContrasts=numberOfChannels,
+                useDiagonalCovarianceMatrices=(
+                    getattr(self, 'useDiagonalCovarianceMatrices', False)),
                 initialHyperMeans=self.meanHyper.copy(),
-                initialHyperMeansNumberOfMeasurements=self.nHyper.copy())
+                initialHyperMeansNumberOfMeasurements=self.nHyper.copy(),
+                initialHyperVariances=np.zeros(
+                    (numberOfGaussians, numberOfChannels, numberOfChannels),
+                    dtype='float64'),
+                initialHyperVariancesNumberOfMeasurements=np.full(
+                    numberOfGaussians, numberOfChannels + 2, dtype='float64'),
+                initialHyperMixtureWeights=hyperMixtureWeights,
+                initialHyperMixtureWeightsNumberOfMeasurements=np.zeros(
+                    len(componentCounts), dtype='float64'))
 
-        # Init empty means and variances
-        self.means = None
-        self.variances = None
+    @staticmethod
+    def _class_gaussian_slices(numberOfGaussiansPerClass):
+        """Return contiguous Gaussian slices in configured class order."""
+        offset = 0
+        slices = []
+        for count in numberOfGaussiansPerClass:
+            slices.append(slice(offset, offset + count))
+            offset += count
+        return slices
+
+    @staticmethod
+    def _covariance_is_usable(covariance):
+        """Return whether a covariance is finite and positive definite."""
+        if not np.all(np.isfinite(covariance)):
+            return False
+        try:
+            np.linalg.cholesky(covariance)
+        except np.linalg.LinAlgError:
+            return False
+        return True
+
+    def _initialize_gmm_parameters(self, data, classPriors):
+        """Create finite current GMM state from the rasterized class priors."""
+        if self.gmm is None:
+            raise RuntimeError(
+                'Configured GMM hyperparameters are required before fitting')
+        if self.gmm.tied:
+            raise NotImplementedError(
+                'Plus initialization does not support tied Gaussians')
+
+        classSlices = self._class_gaussian_slices(
+            self.gmm.numberOfGaussiansPerClass)
+        means = self.gmm.hyperMeans.copy()
+        variances = np.zeros(
+            (self.gmm.numberOfGaussians,
+             self.gmm.numberOfContrasts,
+             self.gmm.numberOfContrasts),
+            dtype='float64')
+        mixtureWeights = self.gmm.hyperMixtureWeights.copy()
+
+        initializationResponsibilities = np.zeros(
+            (len(data), self.gmm.numberOfGaussians),
+            dtype='float64', order='F')
+        seedVariances = getattr(
+            self, '_initializationGaussianVariances', None)
+
+        for classNumber, gaussianSlice in enumerate(classSlices):
+            classPrior = classPriors[:, classNumber]
+            numberOfComponents = (
+                gaussianSlice.stop - gaussianSlice.start)
+            if numberOfComponents == 1:
+                initializationResponsibilities[:, gaussianSlice.start] = (
+                    classPrior)
+                continue
+
+            if seedVariances is None:
+                raise RuntimeError(
+                    f'No initialization covariance state is available for '
+                    f'the {numberOfComponents} components of class '
+                    f'{classNumber}')
+            seedMeans = getattr(self, '_initializationGaussianMeans', None)
+            if seedMeans is None:
+                raise RuntimeError(
+                    f'No initialization mean state is available for the '
+                    f'{numberOfComponents} components of class {classNumber}')
+            means[gaussianSlice] = seedMeans[gaussianSlice]
+            variances[gaussianSlice] = seedVariances[gaussianSlice]
+            for gaussianNumber in range(
+                    gaussianSlice.start, gaussianSlice.stop):
+                if not self._covariance_is_usable(
+                        variances[gaussianNumber]):
+                    raise RuntimeError(
+                        'Initialization evidence did not produce finite '
+                        f'covariance state for Gaussian {gaussianNumber}')
+
+            weightedLikelihoods = np.zeros(
+                (len(data), numberOfComponents), dtype='float64')
+            for componentNumber, gaussianNumber in enumerate(range(
+                    gaussianSlice.start, gaussianSlice.stop)):
+                weightedLikelihoods[:, componentNumber] = (
+                    self.gmm.getGaussianLikelihoods(
+                        data,
+                        np.expand_dims(means[gaussianNumber], 1),
+                        variances[gaussianNumber])
+                    * mixtureWeights[gaussianNumber])
+            normalizer = np.sum(weightedLikelihoods, axis=1)
+            supported = classPrior > 0
+            if (not np.any(supported)
+                    or np.any(~np.isfinite(normalizer[supported]))
+                    or np.any(normalizer[supported] <= 0)):
+                raise RuntimeError(
+                    'Rasterized class prior and initialization evidence '
+                    f'cannot identify all components of class {classNumber}')
+            initializationResponsibilities[
+                supported, gaussianSlice] = (
+                    weightedLikelihoods[supported]
+                    / normalizer[supported, np.newaxis]
+                    * classPrior[supported, np.newaxis])
+
+        # fitGMMParameters owns the established mean/covariance update. These
+        # arrays merely provide writable current state for that first M-step.
+        self.gmm.means = means
+        self.gmm.variances = variances
+        self.gmm.mixtureWeights = mixtureWeights
+        self.gmm.fitGMMParameters(data, initializationResponsibilities)
+
+        # Mature initialization carries the configured uniform weights into the
+        # first ordinary likelihood E-step. Posterior-mass weights are learned
+        # by the next ordinary M-step.
+        self.gmm.mixtureWeights = mixtureWeights
+
+        fallbackCovariance = None
+        for gaussianNumber, covariance in enumerate(self.gmm.variances):
+            if (np.all(np.isfinite(self.gmm.means[gaussianNumber]))
+                    and self._covariance_is_usable(covariance)):
+                continue
+            classNumber = next(
+                classIndex for classIndex, gaussianSlice in enumerate(classSlices)
+                if gaussianSlice.start <= gaussianNumber < gaussianSlice.stop)
+            if self.gmm.numberOfGaussiansPerClass[classNumber] != 1:
+                raise RuntimeError(
+                    'The first GMM M-step did not produce finite state for '
+                    f'Gaussian {gaussianNumber}; multi-component state cannot '
+                    'be inferred without usable initialization evidence')
+            if fallbackCovariance is None:
+                fallbackCovariance = (
+                    self._ensure_model_policy()
+                    .get_initial_gmm_fallback_covariance(self.gmm, data))
+            if (fallbackCovariance is None
+                    or not self._covariance_is_usable(fallbackCovariance)):
+                raise RuntimeError(
+                    'The first GMM M-step did not produce finite state for '
+                    f'class {classNumber}, and no usable model-specific '
+                    'fallback covariance is available')
+            self.gmm.means[gaussianNumber] = self.gmm.hyperMeans[gaussianNumber]
+            self.gmm.variances[gaussianNumber] = fallbackCovariance
+            warnings.warn(
+                'Using model-policy regional fitting covariance fallback for '
+                f'class {classNumber}', RuntimeWarning)
+
+        for classNumber, gaussianSlice in enumerate(classSlices):
+            weights = self.gmm.mixtureWeights[gaussianSlice]
+            if (not np.all(np.isfinite(weights))
+                    or np.any(weights <= 0)
+                    or not np.isclose(np.sum(weights), 1.0)):
+                raise RuntimeError(
+                    f'Initial mixture weights are invalid for class '
+                    f'{classNumber}')
 
     def fit_mesh_to_image(self):
-        """Alternate Gaussian estimation and mesh deformation by resolution.
+        """Fit one configured structural GMM through all resolution levels."""
 
-        Each level operates on the prepared regional image and active reduced
-        classes. Two-stage models fail at their explicit transition seam unless
-        the region supplies a supported target-stage configuration.
-        """
+        if self.gmm is None:
+            raise RuntimeError(
+                'prepare_for_image_fitting(compute_hyps=True) is required '
+                'before authoritative Plus GMM fitting')
 
-        # Keep one stable image buffer for all multiresolution levels.
+        modelPolicy = self._ensure_model_policy()
         imageBuffer = self.workingImage.data.copy(order='K')
-        image = gems.KvlImage(requireNumpyArray(imageBuffer))
-
-        # Dimensions shared by posterior rasterization and class updates.
         numMaskIndices = self.maskIndices[0].shape[-1]
-        numberOfClasses = len(self.sameGaussianParameters)
+        numberOfClasses = self.gmm.numberOfClasses
 
-        # Multi-resolution loop
         numberOfMultiResolutionLevels = len(self.meshSmoothingSigmas)
         for multiResolutionLevel in range(numberOfMultiResolutionLevels):
-
             if self.isLong:
                 self.mesh = self.meshCollection.get_mesh(0)
 
-            # Enter the region-defined target stage at the established level.
             if self.useTwoComponents and multiResolutionLevel == 1:
-                # Get second component label groups
-                labelGroups = self.get_second_label_groups()
-                self.sameGaussianParameters = self.label_group_names_to_indices(labelGroups)
-                numberOfClasses = len(self.sameGaussianParameters)
-                self.reducedAlphas, self.reducingLookupTable = self.reduce_alphas(self.sameGaussianParameters)
-                self.mesh.alphas = self.reducedAlphas
-                # Compute new Gaussian hyperparameters
-                self.meanHyper, self.nHyper = self.get_second_gaussian_hyps(self.sameGaussianParameters, self.meanHyper, self.nHyper)
-                # Reset means and variances to be computed
-                self.means = None
-                self.variances = None
+                raise NotImplementedError(
+                    'A topology change requires a separately configured '
+                    'target shared-GMM model; fixed-topology fitting keeps '
+                    'the existing GMM across resolution levels')
 
             self.mesh.alphas = self.reducedAlphas
 
-            # Smooth the mesh using a Gaussian kernel
             meshSmoothingSigma = self.meshSmoothingSigmas[multiResolutionLevel]
             if meshSmoothingSigma > 0:
                 print(f'Smoothing mesh collection with kernel size {meshSmoothingSigma:.4f}')
                 self.meshCollection.smooth(meshSmoothingSigma)
 
-            # Smooth the image using a Gaussian kernel
             imageSigma = self.imageSmoothingSigmas[multiResolutionLevel]
             if imageSigma > 0:
                 raise NotImplementedError('Image smoothing not implemented yet!')
-
-            # Recreate the GEMS image from the current supported image buffer.
-            image = gems.KvlImage(requireNumpyArray(imageBuffer))
-
-            # Alternate likelihood-parameter and mesh-position updates.
 
             positionUpdatingMaximumNumberOfIterations = 30
             maximumNumberOfIterations = self.maxIterations[multiResolutionLevel]
@@ -1726,140 +1987,97 @@ class MeshModelPlus:
             for iterationNumber in range(maximumNumberOfIterations):
                 print(f'Iteration {iterationNumber + 1} of {maximumNumberOfIterations}')
 
-                # Part I: estimate Gaussian means and variances with EM.
-                # A scalar image becomes an explicit one-channel sample matrix;
-                # framed images already index to samples by channel.
                 if imageBuffer.ndim == 3:
                     data = imageBuffer[self.maskIndices].reshape(-1, 1)
-
                 else:
                     data = imageBuffer[self.maskIndices]
                     if data.ndim != 2:
                         data = data.reshape(-1, imageBuffer.shape[-1])
 
-                # Rasterize each class prior only at the fitting-mask voxels.
-                priors = np.zeros((numMaskIndices, numberOfClasses), dtype='uint16')
-                for l in range(numberOfClasses):
-                    priors[:, l] = self.mesh.rasterize(self.workingImageShape, l)[self.maskIndices]
+                classPriors = np.empty(
+                    (numMaskIndices, numberOfClasses), dtype='float64')
+                for classNumber in range(numberOfClasses):
+                    classPriors[:, classNumber] = (
+                        self.mesh.rasterize(
+                            self.workingImageShape, classNumber)[self.maskIndices]
+                        / 65535)
 
-                posteriors = priors / 65535
-
-                # Initialize parameters on first use of the active class stage.
-                if (self.means is None) or (self.variances is None):
-
-                    n_channels = 1 if imageBuffer.ndim == 3 else imageBuffer.shape[-1]
-                    self.means = np.zeros((numberOfClasses, n_channels))
-                    self.variances = np.zeros((numberOfClasses, n_channels))
-
-                    thresh = 1e-2
-                    for classNumber in range(numberOfClasses):
-                        posterior = posteriors[:, classNumber]
-                        if np.sum(posterior) > thresh:
-
-                            mu = (self.meanHyper[classNumber] * self.nHyper[classNumber] + data.T @ posterior) / (self.nHyper[classNumber] + np.sum(posterior) + thresh)
-                            variance = (((data - mu) ** 2).T @ posterior + self.nHyper[classNumber] * (mu - self.meanHyper[classNumber]) ** 2) / (np.sum(posterior) + thresh)
-                            self.means[classNumber] = mu
-                            self.variances[classNumber] = variance + thresh
-                        else:
-                            self.means[classNumber] = self.meanHyper[classNumber]
-                            self.variances[classNumber] = 100
-
-                    # Prevents NaNs during the optimization
-                    self.variances[self.variances == 0] = 100
-
-                stopCriterionEM = 1e-5
                 historyOfEMCost = []
-                for EMIterationNumber in range(100):
+                completedEMIterations = 0
+                if self.gmm.means is None:
+                    self._initialize_gmm_parameters(data, classPriors)
+                    completedEMIterations = 1
+                gaussianPosteriors, minLogLikelihood = (
+                    self.gmm.getGaussianPosteriors(data, classPriors))
+                # TODO: The maintained historical prior score contributes one
+                # additional 0.5 * log|Sigma| per Gaussian relative to the
+                # covariance stationary point used by fitGMMParameters(). This
+                # affects convergence monitoring, not parameter updates;
+                # revisit only if realistic fitting shows a material effect.
+                currentCost = (
+                    minLogLikelihood
+                    + self.gmm.evaluateMinLogPriorOfGMMParameters())
+                if not np.isfinite(currentCost):
+                    raise RuntimeError(
+                        'Structural GMM objective is not finite')
+                historyOfEMCost.append(currentCost)
 
-                    # E-step: compute the posteriors based on the current parameters
+                maximumEMIterations = modelPolicy.maximumGMMIterations
+                while completedEMIterations < maximumEMIterations:
+                    modelPolicy.update_gmm_parameters(
+                        self.gmm, data, gaussianPosteriors)
+                    completedEMIterations += 1
+                    gaussianPosteriors, minLogLikelihood = (
+                        self.gmm.getGaussianPosteriors(data, classPriors))
+                    currentCost = (
+                        minLogLikelihood
+                        + self.gmm.evaluateMinLogPriorOfGMMParameters())
+                    if not np.isfinite(currentCost):
+                        raise RuntimeError(
+                            'Structural GMM objective is not finite')
 
-                    minLogLikelihood = 0
-                    for classNumber in range(numberOfClasses):
-                        mu = self.means[classNumber]
-                        variance = self.variances[classNumber]
-                        prior = priors[:, classNumber] / 65535
-
-                        log_likelihood = -0.5 * np.sum(((data - mu) ** 2) / variance + np.log(2 * np.pi * variance), axis=1)
-
-                        posteriors[:, classNumber] = np.exp(log_likelihood) * prior
-
-                        minLogLikelihood = minLogLikelihood + 0.5 * np.sum(np.log(2 * np.pi * variance)) - 0.5 * np.log(self.nHyper[classNumber]) + 0.5 * np.sum((self.nHyper[classNumber] / variance) * (mu - self.meanHyper[classNumber]) ** 2)
-
-                    normalizer = np.sum(posteriors, -1) + np.finfo(np.float32).eps
-                    posteriors /= normalizer[..., np.newaxis]
-                    minLogLikelihood = minLogLikelihood - np.sum(np.log(normalizer))  # This is what we're optimizing with EM
-                    if np.isnan(minLogLikelihood):
-                        sf.system.fatal('minLogLikelihood is NaN')
-
-                    # Log some iteration information
-                    iterationInfo = [
+                    print('  '.join([
                         f'Res: {multiResolutionLevel + 1:03d}',
-                        f'Iter: {iterationNumber + 1:03d} | {EMIterationNumber + 1:03d}',
-                        f'MinLL: {minLogLikelihood:.4f}',
-                    ]
-                    print('  '.join(iterationInfo))
+                        f'Iter: {iterationNumber + 1:03d} | '
+                        f'{completedEMIterations:03d}',
+                        f'MinLL: {currentCost:.4f}',
+                    ]))
 
-                    # Track EM history
-                    previous = historyOfEMCost[-1] if historyOfEMCost else np.finfo(np.float32).max
-                    historyOfEMCost.append(minLogLikelihood)
-
-                    # Check for convergence
-                    relativeChangeCost = (previous - minLogLikelihood) / minLogLikelihood
-                    if relativeChangeCost < stopCriterionEM:
-                        print('EM converged!')
-                        break
-
-                    # M-step: derive parameters from the posteriors
-
-                    # Update parameters of Gaussian mixture model
-                    thresh = 1e-2
-                    for classNumber in range(numberOfClasses):
-                        posterior = posteriors[:, classNumber]
-                        if np.sum(posterior) > thresh:
-                            mu = (self.meanHyper[classNumber] * self.nHyper[classNumber] + data.T @ posterior) / (self.nHyper[classNumber] + np.sum(posterior) + thresh)
-                            variance = (((data - mu) ** 2).T @ posterior + self.nHyper[classNumber] * (mu - self.meanHyper[classNumber]) ** 2) / (np.sum(posterior) + thresh)
-                            self.means[classNumber] = mu
-                            self.variances[classNumber] = variance + thresh
+                    previousCost = historyOfEMCost[-1]
+                    historyOfEMCost.append(currentCost)
+                    if modelPolicy.has_gmm_converged(
+                            previousCost,
+                            currentCost,
+                            completedEMIterations):
+                        if currentCost > previousCost:
+                            print('EM objective did not improve - stopping')
                         else:
-                            self.means[classNumber] = self.meanHyper[classNumber]
-                            self.variances[classNumber] = 100
-
-                    # Prevents NaNs during the optimization
-                    self.variances[self.variances == 0] = 100
-
-                # Part II: update mesh positions for the fitted Gaussians.
+                            print('EM converged!')
+                        break
 
                 if self.isLong:
                     self.mesh = self.meshCollection.get_mesh(0)
 
-                # Keep track if the mesh has moved or not
                 haveMoved = False
 
-                # GEMS expects a full covariance matrix for each class.
-                full_variance = np.zeros((self.means.shape[0], self.means.shape[1], self.means.shape[1]))
-                for i in range(self.means.shape[0]):
-                    full_variance[i] = np.diag(self.variances[i])
-
-                # Present scalar and framed data as one GEMS image per channel.
                 if imageBuffer.ndim == 3:
-                    n_channels = 1
                     image_list = [gems.KvlImage(requireNumpyArray(imageBuffer))]
                 else:
-                    n_channels = imageBuffer.shape[-1]
-                    image_list = [gems.KvlImage(requireNumpyArray(imageBuffer[..., idx])) for idx in range(n_channels)]
+                    image_list = [
+                        gems.KvlImage(requireNumpyArray(imageBuffer[..., idx]))
+                        for idx in range(imageBuffer.shape[-1])]
 
-                # Note that it uses variances instead of precisions
                 calculator = gems.KvlCostAndGradientCalculator(
                     typeName='AtlasMeshToIntensityImage',
                     images=image_list,
                     boundaryCondition='Sliding',
                     transform=self.transform,
-                    means=self.means,
-                    variances=full_variance,
-                    mixtureWeights=np.ones(len(self.means), dtype='float32'),
-                    numberOfGaussiansPerClass=np.ones(len(self.means), dtype='int32'))
+                    means=self.gmm.means,
+                    variances=self.gmm.variances,
+                    mixtureWeights=self.gmm.mixtureWeights,
+                    numberOfGaussiansPerClass=np.asarray(
+                        self.gmm.numberOfGaussiansPerClass, dtype='int32'))
 
-                # Get optimizer and plug calculator into it
                 maximalDeformationStopCriterion = 1e-10
                 optimizationParameters = {
                     'Verbose': 0,
@@ -1895,11 +2113,9 @@ class MeshModelPlus:
                         print('maximalDeformation is too small - stopping')
                         break
 
-                # Keep track of the cost function we're optimizing
                 previous = historyOfCost[-1] if historyOfCost else np.finfo(np.float32).max
                 historyOfCost.append(minLogLikelihoodTimesPrior)
 
-                # Determine if we should stop the overall iterations over the two set of parameters
                 if not haveMoved or (((previous - minLogLikelihoodTimesPrior) / minLogLikelihoodTimesPrior) < 1e-6):
                     break
 
@@ -1924,19 +2140,14 @@ class MeshModelPlus:
         else:
             imgdata = imgdata.reshape(-1, self.workingImage.data.shape[-1])
 
-        posteriors = np.zeros((numMaskIndices, numberOfClasses), dtype='float32')
-
+        priors = np.zeros(
+            (numMaskIndices, numberOfClasses), dtype='float64')
         for classNumber in range(numberOfClasses):
             prior = self.mesh.rasterize(self.workingImageShape, classNumber)
-            mu = self.means[self.reducingLookupTable[classNumber]]
-            variance = self.variances[self.reducingLookupTable[classNumber]]
+            priors[:, classNumber] = prior[self.maskIndices] / 65535
 
-            # Evaluate every channel for the class selected by the reduction map.
-            log_likelihood = -0.5 * np.sum(((imgdata - mu) ** 2) / variance + np.log(2 * np.pi * variance), axis=-1)
-            posteriors[:, classNumber] = np.exp(log_likelihood) * (prior[self.maskIndices] / 65535)
-
-        normalizer = np.sum(posteriors, -1) + np.finfo(np.float32).eps
-        posteriors /= normalizer[..., np.newaxis]
+        posteriors = self.gmm.getPosteriors(
+            imgdata, priors, self.classFractions)
         posteriors = np.round(posteriors * 65535).astype('uint16')
 
         if self.debug:

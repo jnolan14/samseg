@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 import surfa as sf
 
+from samseg.GMM import GMM
 from samseg.io import GMMparameter
 from samseg.subregions import core_plus
 from samseg.subregions.core_plus import MeshModelPlus
@@ -596,19 +597,346 @@ def test_configured_structural_model_populates_alphas_and_gmm_mean_priors(
 
     assert model.sameGaussianParameters == [[2, 3], [4]]
     np.testing.assert_allclose(model.reducedAlphas, [[0.5, 0.5]])
-    np.testing.assert_array_equal(model.reducingLookupTable, [0, 0, 1])
     np.testing.assert_array_equal(model.gmm.hyperMeans, expectedMeans)
     np.testing.assert_array_equal(
         model.gmm.fullHyperMeansNumberOfMeasurements,
         expectedStrengths)
     assert model.gmm.numberOfGaussiansPerClass == [1, 1]
     assert model.gmm.numberOfContrasts == 2
-    assert model.gmm.useDiagonalCovarianceMatrices
+    assert not model.gmm.useDiagonalCovarianceMatrices
+    np.testing.assert_array_equal(
+        model.gmm.hyperVariances, np.zeros((2, 2, 2)))
+    np.testing.assert_array_equal(
+        model.gmm.fullHyperVariancesNumberOfMeasurements, [4, 4])
+    np.testing.assert_array_equal(model.gmm.hyperMixtureWeights, [1, 1])
+    np.testing.assert_array_equal(
+        model.gmm.fullHyperMixtureWeightsNumberOfMeasurements, [0, 0])
     assert model.gmm.means is None
     assert model.gmm.variances is None
     assert model.gmm.mixtureWeights is None
     assert model.means is None
     assert model.variances is None
+    assert 'means' not in model.__dict__
+    assert 'variances' not in model.__dict__
+
+
+def test_gaussian_state_accessors_forward_to_the_configured_gmm():
+    model = object.__new__(MeshModelPlus)
+    model.gmm = GMM(
+        [1], 2,
+        initialMeans=np.array([[1.0, 2.0]]),
+        initialVariances=np.array([[[2.0, 0.5], [0.5, 3.0]]]),
+        initialMixtureWeights=np.array([1.0]))
+
+    assert model.means is model.gmm.means
+    assert model.variances is model.gmm.variances
+
+    replacementMeans = np.array([[4.0, 5.0]])
+    replacementVariances = np.array([[[6.0, 0.25], [0.25, 7.0]]])
+    model.means = replacementMeans
+    model.variances = replacementVariances
+
+    assert model.means is replacementMeans
+    assert model.variances is replacementVariances
+    assert model.gmm.means is replacementMeans
+    assert model.gmm.variances is replacementVariances
+    model.means[0, 0] = 8.0
+    assert model.gmm.means[0, 0] == 8.0
+    assert 'means' not in model.__dict__
+    assert 'variances' not in model.__dict__
+
+
+def test_plus_gmm_defaults_full_and_retains_explicit_diagonal_option():
+    defaultModel = MeshModelPlus(
+        atlasDir='atlas', outDir='out', inputImageFileNames=[],
+        inputSegFileName='seg')
+    diagonalModel = MeshModelPlus(
+        atlasDir='atlas', outDir='out', inputImageFileNames=[],
+        inputSegFileName='seg', useDiagonalCovarianceMatrices=True)
+
+    assert not defaultModel.useDiagonalCovarianceMatrices
+    assert diagonalModel.useDiagonalCovarianceMatrices
+
+    thalamusModel = ThalamicNucleiPlus(
+        atlasDir='atlas', outDir='out', inputImageFileNames=[],
+        inputSegFileName='seg')
+    assert not thalamusModel.useTwoComponents
+
+
+def test_first_gmm_m_step_uses_rasterized_class_priors_and_uniform_k1_weight():
+    model = object.__new__(MeshModelPlus)
+    model.gmm = GMM(
+        [1], 2, useDiagonalCovarianceMatrices=False,
+        initialHyperMeans=np.array([[2.0, 2.0]]),
+        initialHyperMeansNumberOfMeasurements=np.array([3.0]),
+        initialHyperVariances=np.zeros((1, 2, 2)),
+        initialHyperVariancesNumberOfMeasurements=np.array([4.0]),
+        initialHyperMixtureWeights=np.array([1.0]),
+        initialHyperMixtureWeightsNumberOfMeasurements=np.array([0.0]))
+    data = np.array([
+        [1.0, 1.0], [1.0, 4.0], [4.0, 1.0], [5.0, 5.0]])
+    classPriors = np.ones((len(data), 1))
+
+    model._initialize_gmm_parameters(data, classPriors)
+
+    assert np.all(np.isfinite(model.gmm.means))
+    np.linalg.cholesky(model.gmm.variances[0])
+    np.testing.assert_array_equal(model.gmm.mixtureWeights, [1.0])
+
+
+def test_first_k1_state_uses_only_the_configured_policy_fallback():
+    model = object.__new__(MeshModelPlus)
+    model.gmm = GMM(
+        [1], 2, useDiagonalCovarianceMatrices=False,
+        initialHyperMeans=np.array([[2.0, 3.0]]),
+        initialHyperMeansNumberOfMeasurements=np.array([3.0]),
+        initialHyperVariances=np.zeros((1, 2, 2)),
+        initialHyperVariancesNumberOfMeasurements=np.array([4.0]),
+        initialHyperMixtureWeights=np.array([1.0]),
+        initialHyperMixtureWeightsNumberOfMeasurements=np.array([0.0]))
+    regionalFittingObservations = np.array([
+        [1.0, 2.0], [2.0, 5.0], [4.0, 4.0], [7.0, 9.0]])
+    classPriors = np.zeros((len(regionalFittingObservations), 1))
+
+    with pytest.raises(RuntimeError, match='no usable model-specific'):
+        model._initialize_gmm_parameters(
+            regionalFittingObservations, classPriors)
+
+    model.modelPolicy = SubregionModelPolicy(
+        initialGMMCovarianceFallback='regional_fitting_covariance')
+    with pytest.warns(RuntimeWarning, match='regional fitting covariance'):
+        model._initialize_gmm_parameters(
+            regionalFittingObservations, classPriors)
+
+    np.testing.assert_array_equal(model.gmm.means, [[2.0, 3.0]])
+    np.testing.assert_allclose(
+        model.gmm.variances[0],
+        np.cov(regionalFittingObservations, rowvar=False, ddof=1))
+    np.testing.assert_array_equal(model.gmm.mixtureWeights, [1.0])
+
+
+def test_disjoint_multicomponent_initialization_orders_and_splits_components():
+    model = object.__new__(MeshModelPlus)
+    values = np.array(
+        [1.0, 2.0, 3.0, 4.0, 10.0, 11.0, 12.0, 13.0],
+        dtype='float32')
+    model.intensityPriorImage = _volume(values[:, None, None, None])
+    model.workingImage = _volume(np.ones((8, 1, 1), dtype='float32'))
+    model.intensityPriorInitializationSegmentation = _volume(
+        np.full((8, 1, 1), 2, dtype='int32'))
+    model.intensityPriorInitializationMask = _volume(
+        np.ones((8, 1, 1), dtype='uint8'))
+    model.sharedGMMParameters = [
+        GMMparameter('TwoModes', 2, ['TwoModes'])]
+    model.useDiagonalCovarianceMatrices = False
+
+    means, strengths = model._estimate_intensity_hyperparameters([[2]])
+    np.testing.assert_allclose(means[:, 0], [2.5, 11.5])
+    np.testing.assert_allclose(strengths, [4.0, 4.0])
+
+    model.gmm = GMM(
+        [2], 1, useDiagonalCovarianceMatrices=False,
+        initialHyperMeans=means,
+        initialHyperMeansNumberOfMeasurements=strengths,
+        initialHyperVariances=np.zeros((2, 1, 1)),
+        initialHyperVariancesNumberOfMeasurements=np.full(2, 3.0),
+        initialHyperMixtureWeights=np.array([0.5, 0.5]),
+        initialHyperMixtureWeightsNumberOfMeasurements=np.array([0.0]))
+    model._initialize_gmm_parameters(
+        values[:, None], np.ones((len(values), 1)))
+
+    assert model.gmm.means[0, 0] < model.gmm.means[1, 0]
+    for covariance in model.gmm.variances:
+        np.linalg.cholesky(covariance)
+    np.testing.assert_array_equal(model.gmm.mixtureWeights, [0.5, 0.5])
+
+
+def test_low_mass_retention_preserves_components_and_class_weight_simplex():
+    model = object.__new__(MeshModelPlus)
+    model.gmm = GMM(
+        [3, 2], 1, useDiagonalCovarianceMatrices=False,
+        initialMeans=np.array([[1.0], [3.0], [7.0], [2.0], [8.0]]),
+        initialVariances=np.array([[[2.0]], [[3.0]], [[4.0]], [[5.0]], [[6.0]]]),
+        initialMixtureWeights=np.array([0.2, 0.3, 0.5, 0.4, 0.6]),
+        initialHyperMeans=np.array([[1.0], [3.0], [7.0], [2.0], [8.0]]),
+        initialHyperMeansNumberOfMeasurements=np.ones(5),
+        initialHyperVariances=np.zeros((5, 1, 1)),
+        initialHyperVariancesNumberOfMeasurements=np.full(5, 3.0),
+        initialHyperMixtureWeights=np.array([1/3, 1/3, 1/3, 0.5, 0.5]),
+        initialHyperMixtureWeightsNumberOfMeasurements=np.zeros(2))
+    data = np.array([[1.0], [2.0], [5.0], [9.0]])
+    posteriors = np.array([
+        [4.0, 0.0025, 1.0, 0.0002, 0.0002],
+        [3.0, 0.0025, 3.0, 0.0002, 0.0002],
+        [2.0, 0.0025, 7.0, 0.0002, 0.0002],
+        [1.0, 0.0025, 9.0, 0.0002, 0.0002],
+    ])
+    previousMeans = model.gmm.means.copy()
+    previousVariances = model.gmm.variances.copy()
+    previousWeights = model.gmm.mixtureWeights.copy()
+
+    ordinary = GMM(
+        [3, 2], 1, useDiagonalCovarianceMatrices=False,
+        initialMeans=model.gmm.means.copy(),
+        initialVariances=model.gmm.variances.copy(),
+        initialMixtureWeights=model.gmm.mixtureWeights.copy(),
+        initialHyperMeans=model.gmm.hyperMeans.copy(),
+        initialHyperMeansNumberOfMeasurements=(
+            model.gmm.fullHyperMeansNumberOfMeasurements.copy()),
+        initialHyperVariances=model.gmm.hyperVariances.copy(),
+        initialHyperVariancesNumberOfMeasurements=(
+            model.gmm.fullHyperVariancesNumberOfMeasurements.copy()),
+        initialHyperMixtureWeights=model.gmm.hyperMixtureWeights.copy(),
+        initialHyperMixtureWeightsNumberOfMeasurements=(
+            model.gmm.fullHyperMixtureWeightsNumberOfMeasurements.copy()))
+    ordinary.fitGMMParameters(data, posteriors)
+
+    SubregionModelPolicy().update_gmm_parameters(
+        model.gmm, data, posteriors)
+
+    np.testing.assert_allclose(model.gmm.means[[0, 2]], ordinary.means[[0, 2]])
+    np.testing.assert_allclose(
+        model.gmm.variances[[0, 2]], ordinary.variances[[0, 2]])
+    np.testing.assert_array_equal(model.gmm.means[[1, 3, 4]], previousMeans[[1, 3, 4]])
+    np.testing.assert_array_equal(
+        model.gmm.variances[[1, 3, 4]], previousVariances[[1, 3, 4]])
+    assert model.gmm.mixtureWeights[1] == previousWeights[1]
+    np.testing.assert_array_equal(
+        model.gmm.mixtureWeights[3:5], previousWeights[3:5])
+    np.testing.assert_allclose(
+        model.gmm.mixtureWeights[[0, 2]]
+        / np.sum(model.gmm.mixtureWeights[[0, 2]]),
+        ordinary.mixtureWeights[[0, 2]]
+        / np.sum(ordinary.mixtureWeights[[0, 2]]))
+    np.testing.assert_allclose(
+        [np.sum(model.gmm.mixtureWeights[:3]),
+         np.sum(model.gmm.mixtureWeights[3:])],
+        [1.0, 1.0])
+
+
+def test_fixed_topology_fit_hands_authoritative_multicomponent_gmm_to_gems(
+        monkeypatch):
+    captured = {}
+    gmmUpdateCount = 0
+
+    class Mesh:
+        alphas = None
+
+        def rasterize(self, shape, classNumber):
+            assert classNumber == 0
+            return np.full(shape, 65535, dtype='uint16')
+
+    class MeshCollection:
+        def smooth(self, sigma):
+            raise AssertionError('zero smoothing should not call smooth')
+
+    class Calculator:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class Optimizer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def step_optimizer_samseg(self):
+            return 1.0, 0.0
+
+    model = object.__new__(MeshModelPlus)
+    model.workingImage = _volume(
+        np.array([[[1.0]], [[1.5]], [[2.5]], [[3.0]]], dtype='float32'))
+    model.workingImageShape = model.workingImage.shape
+    model.maskIndices = np.where(np.ones(model.workingImageShape, dtype=bool))
+    model.mesh = Mesh()
+    model.meshCollection = MeshCollection()
+    model.reducedAlphas = np.ones((1, 1), dtype='float32')
+    model.meshSmoothingSigmas = [0]
+    model.imageSmoothingSigmas = [0]
+    model.maxIterations = [1]
+    model.isLong = False
+    model.useTwoComponents = False
+    model.optimizerType = 'L-BFGS'
+    model.transform = object()
+    model.gmm = GMM(
+        [2], 1, useDiagonalCovarianceMatrices=False,
+        initialMeans=np.array([[1.0], [3.0]]),
+        initialVariances=np.array([[[1.0]], [[1.0]]]),
+        initialMixtureWeights=np.array([0.5, 0.5]),
+        initialHyperMeans=np.array([[1.0], [3.0]]),
+        initialHyperMeansNumberOfMeasurements=np.array([5.0, 5.0]),
+        initialHyperVariances=np.zeros((2, 1, 1)),
+        initialHyperVariancesNumberOfMeasurements=np.full(2, 3.0),
+        initialHyperMixtureWeights=np.array([0.5, 0.5]),
+        initialHyperMixtureWeightsNumberOfMeasurements=np.array([0.0]))
+    model.modelPolicy = SubregionModelPolicy(maximumGMMIterations=2)
+    fitGMMParameters = model.gmm.fitGMMParameters
+
+    def count_gmm_update(data, gaussianPosteriors):
+        nonlocal gmmUpdateCount
+        gmmUpdateCount += 1
+        fitGMMParameters(data, gaussianPosteriors)
+
+    model.gmm.fitGMMParameters = count_gmm_update
+    monkeypatch.setattr(core_plus.gems, 'KvlImage', lambda data: data)
+    monkeypatch.setattr(
+        core_plus.gems, 'KvlCostAndGradientCalculator', Calculator)
+    monkeypatch.setattr(core_plus.gems, 'KvlOptimizer', Optimizer)
+
+    model.fit_mesh_to_image()
+
+    assert captured['means'] is model.gmm.means
+    assert captured['variances'] is model.gmm.variances
+    assert captured['mixtureWeights'] is model.gmm.mixtureWeights
+    np.testing.assert_array_equal(
+        captured['numberOfGaussiansPerClass'], [2])
+    assert gmmUpdateCount == 2
+
+
+def test_extraction_uses_authoritative_gmm_and_class_fractions(monkeypatch):
+    captured = {}
+
+    class Mesh:
+        def __init__(self):
+            self.alphas = None
+
+        def rasterize(self, shape, classNumber=None):
+            if classNumber is None:
+                channels = self.alphas.shape[1]
+                return np.full(tuple(shape) + (channels,), 32767, dtype='uint16')
+            return np.full(shape, 32767, dtype='uint16')
+
+    class GMMView:
+        def getPosteriors(self, data, priors, classFractions):
+            captured['data'] = data
+            captured['priors'] = priors
+            captured['classFractions'] = classFractions
+            return np.array([[0.8, 0.2], [0.1, 0.9]])
+
+    model = object.__new__(MeshModelPlus)
+    model.mesh = Mesh()
+    model.originalAlphas = np.array([[0.5, 0.5]], dtype='float32')
+    model.workingImage = _volume(
+        np.array([[[1.0]], [[2.0]]], dtype='float32'))
+    model.workingImageShape = model.workingImage.shape
+    model.maskIndices = np.where(np.ones(model.workingImageShape, dtype=bool))
+    model.workingMask = _volume(
+        np.ones(model.workingImageShape, dtype='uint8'))
+    model.classFractions = np.eye(2)
+    model.gmm = GMMView()
+    model.debug = False
+    model.resolution = 1.0
+    model.names = ['Unknown', 'Tissue']
+    model.FreeSurferLabels = np.array([0, 2])
+    monkeypatch.setattr(
+        core_plus.sf, 'load_label_lookup', lambda filename: sf.LabelLookup())
+    monkeypatch.setenv('FREESURFER_HOME', '/unused')
+
+    model.extract_segmentation()
+
+    np.testing.assert_array_equal(captured['classFractions'], np.eye(2))
+    np.testing.assert_allclose(captured['data'][:, 0], [1.0, 2.0])
+    assert captured['priors'].shape == (2, 2)
+    np.testing.assert_array_equal(
+        model.discreteLabels.data[:, 0, 0], [0, 2])
 
 
 def test_regional_em_mask_accepts_finite_negative_and_rejects_missing_channels(

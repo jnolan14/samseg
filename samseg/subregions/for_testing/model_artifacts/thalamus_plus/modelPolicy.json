@@ -8,6 +8,8 @@
   "localizer_anatomical_support_margin_mm": 1.5,
   "preliminary_atlas_domain_interior_margin_mm": 3.0,
   "regional_atlas_domain_interior_margin_mm": 2.0,
+  "initial_gmm_covariance_fallback": "regional_fitting_covariance",
+  "maximum_gmm_iterations": 100,
   "zero_evidence_initialization": {
     "strategy": "subject_non_background_median",
     "strength": 10.0
