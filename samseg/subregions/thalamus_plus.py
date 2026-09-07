@@ -26,10 +26,10 @@ class ThalamicNucleiPlus(MeshModelPlus):
     """Provide thalamus model selection and regional lifecycle behavior.
 
     The region selects preliminary artifacts, constructs thalamic alignment and
-    crop targets, supplies refinement decisions, gates unsupported target-stage
-    transitions, and postprocesses thalamic output. ``MeshModelPlus`` owns
-    shared geometry, configured structural grouping, initialization evidence,
-    and hyperparameter mechanics.
+    crop targets, supplies refinement decisions, and postprocesses thalamic
+    output. ``MeshModelPlus`` owns shared geometry, configured structural
+    grouping and transitions, initialization evidence, and hyperparameter
+    mechanics.
     """
 
     # -------------------------------------------------------------------------
@@ -395,22 +395,6 @@ class ThalamicNucleiPlus(MeshModelPlus):
         """
         return self._estimate_intensity_hyperparameters(
             sameGaussianParameters)
-
-    # -------------------------------------------------------------------------
-    # Deferred intensity-stage transition gates
-    # -------------------------------------------------------------------------
-
-    def get_second_label_groups(self):
-        """Fail until a configured target-stage grouping is available."""
-        raise NotImplementedError(
-            'ThalamicNucleiPlus refinement requires configured source and '
-            'target intensity stages with atlas-membership correspondence')
-
-    def get_second_gaussian_hyps(self, sameGaussianParameters, meanHyper, nHyper):
-        """Fail until target-stage hyperparameters and transfer are available."""
-        raise NotImplementedError(
-            'ThalamicNucleiPlus refinement hyperparameters require configured '
-            'source and target intensity stages')
 
     # -------------------------------------------------------------------------
     # Segmentation output

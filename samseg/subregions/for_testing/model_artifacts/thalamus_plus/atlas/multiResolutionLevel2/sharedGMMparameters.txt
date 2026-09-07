@@ -1,0 +1,12 @@
+# Structural Gaussian grouping reconstructed for multiResolutionLevel 2 of the
+# FreeSurfer average/ThalamicNuclei/atlas model. The lateral/medial partition is
+# established by the legacy MATLAB and Python models; this configured form is
+# paired with that bundle's 66-label compressionLookupTable.txt. Unmatched LUT
+# structures are completed as exact-name one-component singleton classes.
+#
+# The format is: mergedName numberOfComponents searchStrings
+
+CerebralWM 1 Cerebral-White-Matter R'
+VentralDC 1 VentralDC
+LateralThal 1 L-Sg' LGN' MGN' H' VPI' MV(Re)' Pf' CM' LP' VLa' VPL' VLp' VM' CeM' Pc' MDv' Pv' CL' VA' VPM' AV' VAmc' Pt' AD' LD'
+MedialThal 1 PuA' PuI' PuL' PuM' MDl' MDm'

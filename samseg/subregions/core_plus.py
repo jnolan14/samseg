@@ -52,12 +52,13 @@ class MeshModelPlus:
         optimizerType='L-BFGS',
         bbregisterMode=None,
         resolution=0.5,
-        useTwoComponents=False,
         tempDir=None,
         fileSuffix='',
         debug=False,
         preliminarySharedGMMParametersFileName=None,
         gmmFileName=None,
+        targetGMMFileName=None,
+        targetGMMActivationLevelIndex=None,
         useDiagonalCovarianceMatrices=False,
         ):
         """Initialize shared lifecycle state and region-configurable defaults."""
@@ -73,6 +74,9 @@ class MeshModelPlus:
         self.preliminarySharedGMMParametersFileName = (
             preliminarySharedGMMParametersFileName)
         self.gmmFileName = gmmFileName
+        self.targetGMMFileName = targetGMMFileName
+        self.targetGMMActivationLevelIndex = (
+            targetGMMActivationLevelIndex)
         self.useDiagonalCovarianceMatrices = useDiagonalCovarianceMatrices
         self.preliminaryModelProfileName = None
         self.preliminaryLocalizerLookupTableFileName = None
@@ -83,7 +87,6 @@ class MeshModelPlus:
         self.optimizerType = optimizerType
         self.bbregisterMode = bbregisterMode
         self.resolution = resolution
-        self.useTwoComponents = useTwoComponents
         self.tempDir = tempDir
         self.fileSuffix = fileSuffix
         self.debug = debug
@@ -121,6 +124,9 @@ class MeshModelPlus:
         self.sharedGMMParameters = None
         self.classFractions = None
         self.gmm = None
+        self._pendingTargetSharedGMMParameters = None
+        self._pendingTargetClassFractions = None
+        self._pendingSourceClassForTargetClass = None
         self.optimizationHistory = []
 
         # Some optimization defaults that should be overwritten by each subclass
@@ -221,14 +227,13 @@ class MeshModelPlus:
         # intensity representations described by preprocess_images().
         self.preprocess_images()
 
-    def _configure_shared_gmm_parameters(self):
-        """Resolve the configured structural GMM against the selected LUT."""
-        if self.gmmFileName is None:
+    def _resolve_shared_gmm_parameters(self, fileName, description):
+        """Resolve one configured structural GMM against the selected LUT."""
+        if fileName is None:
             raise ValueError(
-                'A structural GMM parameter file must be supplied through '
-                'gmmFileName')
+                f'A {description} structural GMM parameter file is required')
 
-        gmmFileName = os.fspath(self.gmmFileName)
+        gmmFileName = os.fspath(fileName)
         if not os.path.isfile(gmmFileName):
             gmmFileName = os.path.join(self.atlasDir, gmmFileName)
         if not os.path.isfile(gmmFileName):
@@ -252,11 +257,103 @@ class MeshModelPlus:
                 'Plus structural GMM initialization does not yet support '
                 'structures shared across multiple parameter rows')
 
-        self.gmmFileName = gmmFileName
-        self.sharedGMMParameters = sharedGMMParameters
-        # In the supported disjoint case, mature Boolean membership and
-        # maintained SAMSEG class fractions are exactly equivalent.
-        self.classFractions = memberships.astype(float)
+        return gmmFileName, sharedGMMParameters, memberships.astype(float)
+
+    def _configure_shared_gmm_parameters(self):
+        """Resolve source and optional target structural GMM configuration."""
+        (self.gmmFileName,
+         self.sharedGMMParameters,
+         self.classFractions) = self._resolve_shared_gmm_parameters(
+            self.gmmFileName, 'source')
+
+        targetFileName = self.targetGMMFileName
+        activationLevelIndex = self.targetGMMActivationLevelIndex
+        if (targetFileName is None) != (activationLevelIndex is None):
+            raise ValueError(
+                'targetGMMFileName and targetGMMActivationLevelIndex must '
+                'either both be supplied or both be omitted')
+
+        self._pendingTargetSharedGMMParameters = None
+        self._pendingTargetClassFractions = None
+        self._pendingSourceClassForTargetClass = None
+        if targetFileName is None:
+            return
+
+        if (isinstance(activationLevelIndex, (bool, np.bool_))
+                or not isinstance(activationLevelIndex, (int, np.integer))):
+            raise ValueError(
+                'targetGMMActivationLevelIndex must be an integer')
+        if activationLevelIndex < 1:
+            raise ValueError(
+                'targetGMMActivationLevelIndex is zero-based and must be '
+                'after the first level; a topology needed from the first '
+                'level belongs in the source gmmFileName')
+        if activationLevelIndex >= len(self.meshSmoothingSigmas):
+            raise ValueError(
+                'targetGMMActivationLevelIndex must select a resolution '
+                'level after the first and within the configured schedule')
+
+        (self.targetGMMFileName,
+         targetParameters,
+         targetFractions) = self._resolve_shared_gmm_parameters(
+            targetFileName, 'target')
+        (sourceClassForTargetClass,
+         targetClassIsUnchanged) = (
+            self._derive_gmm_topology_correspondence(
+                self.sharedGMMParameters,
+                self.classFractions,
+                targetParameters,
+                targetFractions))
+        if not (
+            len(self.sharedGMMParameters)
+            == len(targetParameters)
+            and np.all(targetClassIsUnchanged)):
+            self._pendingTargetSharedGMMParameters = targetParameters
+            self._pendingTargetClassFractions = targetFractions
+            self._pendingSourceClassForTargetClass = sourceClassForTargetClass
+
+    @staticmethod
+    def _derive_gmm_topology_correspondence(
+            sourceParameters,
+            sourceMemberships,
+            targetParameters,
+            targetMemberships):
+        """Map resolved disjoint partitions of the same LUT to source owners."""
+        sourceMemberships = np.asarray(sourceMemberships, dtype=bool)
+        targetMemberships = np.asarray(targetMemberships, dtype=bool)
+
+        sourceOwners = np.argmax(sourceMemberships, axis=0)
+        sourceClassForTargetClass = np.empty(
+            len(targetParameters), dtype='int64')
+        targetClassIsUnchanged = np.zeros(
+            len(targetParameters), dtype=bool)
+        for targetClass, targetMembership in enumerate(targetMemberships):
+            sourceClasses = np.unique(sourceOwners[targetMembership])
+            if len(sourceClasses) != 1:
+                raise NotImplementedError(
+                    'Target structural GMM classes may not merge or '
+                    'cross-cut source classes')
+            sourceClass = int(sourceClasses[0])
+            sourceClassForTargetClass[targetClass] = sourceClass
+            unchanged = np.array_equal(
+                targetMembership, sourceMemberships[sourceClass])
+            targetClassIsUnchanged[targetClass] = unchanged
+
+            sourceComponents = sourceParameters[
+                sourceClass].numberOfComponents
+            targetComponents = targetParameters[
+                targetClass].numberOfComponents
+            if unchanged:
+                if targetComponents != sourceComponents:
+                    raise NotImplementedError(
+                        'An unchanged structural GMM class may not change '
+                        'its number of Gaussian components')
+            elif sourceComponents != 1 or targetComponents != 1:
+                raise NotImplementedError(
+                    'Topology-changing structural GMM classes currently '
+                    'require one source and one target Gaussian')
+
+        return sourceClassForTargetClass, targetClassIsUnchanged
 
     # -------------------------------------------------------------------------
     # Regional preprocessing and shared input geometry
@@ -1751,14 +1848,14 @@ class MeshModelPlus:
         self.gmm = None
         if compute_hyps:
             # Compute the hyperparameters
-            self.meanHyper, self.nHyper = self.get_gaussian_hyps(
+            meanHyper, nHyper = self.get_gaussian_hyps(
                 self.sameGaussianParameters,
                 self.mesh)
             componentCounts = [
                 parameter.numberOfComponents
                 for parameter in self.sharedGMMParameters]
             numberOfGaussians = int(np.sum(componentCounts))
-            numberOfChannels = self.meanHyper.shape[1]
+            numberOfChannels = meanHyper.shape[1]
             hyperMixtureWeights = np.empty(
                 numberOfGaussians, dtype='float64')
             gaussianOffset = 0
@@ -1772,8 +1869,8 @@ class MeshModelPlus:
                 numberOfContrasts=numberOfChannels,
                 useDiagonalCovarianceMatrices=(
                     getattr(self, 'useDiagonalCovarianceMatrices', False)),
-                initialHyperMeans=self.meanHyper.copy(),
-                initialHyperMeansNumberOfMeasurements=self.nHyper.copy(),
+                initialHyperMeans=meanHyper.copy(),
+                initialHyperMeansNumberOfMeasurements=nHyper.copy(),
                 initialHyperVariances=np.zeros(
                     (numberOfGaussians, numberOfChannels, numberOfChannels),
                     dtype='float64'),
@@ -1803,6 +1900,163 @@ class MeshModelPlus:
         except np.linalg.LinAlgError:
             return False
         return True
+
+    @classmethod
+    def _validate_gmm_state_for_fitting(cls, gmm, description):
+        """Validate current and hyperparameter state before authoritative use."""
+        numberOfGaussians = gmm.numberOfGaussians
+        numberOfContrasts = gmm.numberOfContrasts
+        numberOfClasses = gmm.numberOfClasses
+        gaussianShape = (numberOfGaussians, numberOfContrasts)
+        covarianceShape = (
+            numberOfGaussians, numberOfContrasts, numberOfContrasts)
+
+        if (np.shape(gmm.means) != gaussianShape
+                or np.shape(gmm.variances) != covarianceShape
+                or np.shape(gmm.mixtureWeights) != (numberOfGaussians,)):
+            raise RuntimeError(
+                f'{description} fitted GMM state has incompatible shapes')
+        if (not np.all(np.isfinite(gmm.means))
+                or not np.all(np.isfinite(gmm.mixtureWeights))
+                or np.any(gmm.mixtureWeights <= 0)
+                or any(not cls._covariance_is_usable(covariance)
+                       for covariance in gmm.variances)):
+            raise RuntimeError(
+                f'{description} fitted GMM state is not finite and usable')
+
+        componentShapes = {
+            'hyperMeans': gaussianShape,
+            'hyperVariances': covarianceShape,
+            'hyperMixtureWeights': (numberOfGaussians,),
+            'fullHyperMeansNumberOfMeasurements': (numberOfGaussians,),
+            'hyperMeansNumberOfMeasurements': (numberOfGaussians,),
+            'fullHyperVariancesNumberOfMeasurements': (numberOfGaussians,),
+            'hyperVariancesNumberOfMeasurements': (numberOfGaussians,),
+            'fullHyperMixtureWeightsNumberOfMeasurements': (numberOfClasses,),
+            'hyperMixtureWeightsNumberOfMeasurements': (numberOfClasses,),
+        }
+        for fieldName, expectedShape in componentShapes.items():
+            value = np.asarray(getattr(gmm, fieldName))
+            if value.shape != expectedShape or not np.all(np.isfinite(value)):
+                raise RuntimeError(
+                    f'{description} GMM field {fieldName} is invalid')
+
+        nonnegativeFields = (
+            'fullHyperMeansNumberOfMeasurements',
+            'hyperMeansNumberOfMeasurements',
+            'fullHyperVariancesNumberOfMeasurements',
+            'hyperVariancesNumberOfMeasurements',
+            'fullHyperMixtureWeightsNumberOfMeasurements',
+            'hyperMixtureWeightsNumberOfMeasurements',
+        )
+        if any(np.any(np.asarray(getattr(gmm, fieldName)) < 0)
+               for fieldName in nonnegativeFields):
+            raise RuntimeError(
+                f'{description} GMM measurement counts must be nonnegative')
+
+        for gaussianSlice in cls._class_gaussian_slices(
+                gmm.numberOfGaussiansPerClass):
+            weights = gmm.mixtureWeights[gaussianSlice]
+            hyperWeights = gmm.hyperMixtureWeights[gaussianSlice]
+            if (not np.isclose(np.sum(weights), 1.0)
+                    or np.any(hyperWeights <= 0)
+                    or not np.isclose(np.sum(hyperWeights), 1.0)):
+                raise RuntimeError(
+                    f'{description} GMM mixture weights are invalid')
+
+    @classmethod
+    def _build_transferred_gmm(
+            cls, sourceGMM, targetParameters, sourceClassForTargetClass):
+        """Build an independent target GMM from unambiguously mapped state."""
+        if sourceGMM.tied:
+            raise NotImplementedError(
+                'Plus topology transition does not support tied Gaussians')
+
+        sourceCounts = list(sourceGMM.numberOfGaussiansPerClass)
+        targetCounts = [
+            parameter.numberOfComponents for parameter in targetParameters]
+        sourceSlices = cls._class_gaussian_slices(sourceCounts)
+        targetSlices = cls._class_gaussian_slices(targetCounts)
+        sourceGaussianForTargetGaussian = np.empty(
+            sum(targetCounts), dtype='int64')
+        for targetClass, sourceClass in enumerate(
+                sourceClassForTargetClass):
+            sourceGaussianNumbers = np.arange(
+                sourceSlices[sourceClass].start,
+                sourceSlices[sourceClass].stop)
+            targetGaussianNumbers = np.arange(
+                targetSlices[targetClass].start,
+                targetSlices[targetClass].stop)
+            sourceGaussianForTargetGaussian[targetGaussianNumbers] = (
+                sourceGaussianNumbers)
+
+        gaussianMap = sourceGaussianForTargetGaussian
+        classMap = np.asarray(sourceClassForTargetClass, dtype='int64')
+        targetGMM = GMM(
+            targetCounts,
+            numberOfContrasts=sourceGMM.numberOfContrasts,
+            useDiagonalCovarianceMatrices=(
+                sourceGMM.useDiagonalCovarianceMatrices),
+            initialMeans=sourceGMM.means[gaussianMap].copy(),
+            initialVariances=sourceGMM.variances[gaussianMap].copy(),
+            initialMixtureWeights=(
+                sourceGMM.mixtureWeights[gaussianMap].copy()),
+            initialHyperMeans=sourceGMM.hyperMeans[gaussianMap].copy(),
+            initialHyperMeansNumberOfMeasurements=(
+                sourceGMM.fullHyperMeansNumberOfMeasurements[
+                    gaussianMap].copy()),
+            initialHyperVariances=(
+                sourceGMM.hyperVariances[gaussianMap].copy()),
+            initialHyperVariancesNumberOfMeasurements=(
+                sourceGMM.fullHyperVariancesNumberOfMeasurements[
+                    gaussianMap].copy()),
+            initialHyperMixtureWeights=(
+                sourceGMM.hyperMixtureWeights[gaussianMap].copy()),
+            initialHyperMixtureWeightsNumberOfMeasurements=(
+                sourceGMM.fullHyperMixtureWeightsNumberOfMeasurements[
+                    classMap].copy()))
+        targetGMM.hyperMeansNumberOfMeasurements = (
+            sourceGMM.hyperMeansNumberOfMeasurements[gaussianMap].copy())
+        targetGMM.hyperVariancesNumberOfMeasurements = (
+            sourceGMM.hyperVariancesNumberOfMeasurements[gaussianMap].copy())
+        targetGMM.hyperMixtureWeightsNumberOfMeasurements = (
+            sourceGMM.hyperMixtureWeightsNumberOfMeasurements[
+                classMap].copy())
+        return targetGMM
+
+    def _activate_gmm_topology_transition(self):
+        """Publish one configured target after validated state transfer."""
+        targetGMM = self._build_transferred_gmm(
+            self.gmm,
+            self._pendingTargetSharedGMMParameters,
+            self._pendingSourceClassForTargetClass)
+        self._ensure_model_policy().modify_transferred_gmm_state(
+            targetGMM,
+            tuple(self._pendingTargetSharedGMMParameters),
+            self._pendingSourceClassForTargetClass.copy())
+        self._validate_gmm_state_for_fitting(targetGMM, 'Policy-modified target')
+
+        targetClassFractions = self._pendingTargetClassFractions.copy()
+        targetSameGaussianParameters = [
+            np.asarray(self.FreeSurferLabels)[fractions > 0].tolist()
+            for fractions in targetClassFractions
+        ]
+        targetReducedAlphas = kvlMergeAlphas(
+            self.originalAlphas, targetClassFractions)
+
+        # Publish only after correspondence, state, policy, and alpha reduction
+        # have all succeeded, so failure leaves the fitted source authoritative.
+        self.mesh.alphas = targetReducedAlphas
+        self.sharedGMMParameters = list(self._pendingTargetSharedGMMParameters)
+        self.classFractions = targetClassFractions
+        self.sameGaussianParameters = targetSameGaussianParameters
+        self.reducedAlphas = targetReducedAlphas
+        self.gmm = targetGMM
+        self._initializationGaussianMeans = None
+        self._initializationGaussianVariances = None
+        self._pendingTargetSharedGMMParameters = None
+        self._pendingTargetClassFractions = None
+        self._pendingSourceClassForTargetClass = None
 
     def _initialize_gmm_parameters(self, data, classPriors):
         """Create finite current GMM state from the rasterized class priors."""
@@ -1943,20 +2197,25 @@ class MeshModelPlus:
         modelPolicy = self._ensure_model_policy()
         imageBuffer = self.workingImage.data.copy(order='K')
         numMaskIndices = self.maskIndices[0].shape[-1]
-        numberOfClasses = self.gmm.numberOfClasses
+
+        activationLevelIndex = self.targetGMMActivationLevelIndex
+        if (self._pendingTargetSharedGMMParameters is not None
+                and activationLevelIndex >= len(self.meshSmoothingSigmas)):
+            raise ValueError(
+                'The configured target GMM activation level is not present '
+                'in the active resolution schedule')
 
         numberOfMultiResolutionLevels = len(self.meshSmoothingSigmas)
         for multiResolutionLevel in range(numberOfMultiResolutionLevels):
             if self.isLong:
                 self.mesh = self.meshCollection.get_mesh(0)
 
-            if self.useTwoComponents and multiResolutionLevel == 1:
-                raise NotImplementedError(
-                    'A topology change requires a separately configured '
-                    'target shared-GMM model; fixed-topology fitting keeps '
-                    'the existing GMM across resolution levels')
+            if (self._pendingTargetSharedGMMParameters is not None
+                    and multiResolutionLevel == activationLevelIndex):
+                self._activate_gmm_topology_transition()
 
             self.mesh.alphas = self.reducedAlphas
+            numberOfClasses = self.gmm.numberOfClasses
 
             meshSmoothingSigma = self.meshSmoothingSigmas[multiResolutionLevel]
             if meshSmoothingSigma > 0:
@@ -2230,11 +2489,3 @@ class MeshModelPlus:
     def get_gaussian_hyps(self, sameGaussianParameters, mesh):
         """Return mean and strength hyperparameters for the active classes."""
         raise NotImplementedError('A MeshModel subclass must implement the get_gaussian_hyps() function!')
-
-    def get_second_label_groups(self):
-        """Return target-stage grouping for a supported two-stage model."""
-        raise NotImplementedError('A two-component MeshModel must implement the get_second_label_groups() function!')
-
-    def get_second_gaussian_hyps(self, sameGaussianParameters, meanHyper, nHyper):
-        """Return target-stage hyperparameters for a supported two-stage model."""
-        raise NotImplementedError('A two-component MeshModel must implement the get_second_gaussian_hyps() function!')

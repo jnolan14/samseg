@@ -254,6 +254,20 @@ class SubregionModelPolicy:
                 f'{self.initialGMMCovarianceFallback!r}') from error
         return fallback(gmm, regionalFittingObservations)
 
+    def modify_transferred_gmm_state(
+            self,
+            gmm,
+            targetSharedGMMParameters,
+            sourceClassForTargetClass):
+        """Apply model behavior after generic topology state transfer.
+
+        The default leaves transferred state unchanged. The stable
+        hook keeps topology correspondence and copying in ``MeshModelPlus``
+        while allowing later configured comparison behavior to alter only the
+        unpublished target GMM.
+        """
+        return None
+
     def has_gmm_converged(
             self, previousObjective, currentObjective, completedIterations):
         """Return whether the configured structural GMM has converged."""

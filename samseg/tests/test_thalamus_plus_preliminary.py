@@ -33,6 +33,9 @@ POLICY_FILE = MODEL_ARTIFACT_DIR / 'modelPolicy.json'
 STRUCTURAL_PARAMETER_FILE = (
     MODEL_ARTIFACT_DIR / 'atlas' / 'multiResolutionLevel1'
     / 'sharedGMMparameters.txt')
+TARGET_STRUCTURAL_PARAMETER_FILE = (
+    MODEL_ARTIFACT_DIR / 'atlas' / 'multiResolutionLevel2'
+    / 'sharedGMMparameters.txt')
 
 # Captured label-name inventories from the historical structural atlas, the
 # installed DTI atlas, and the mature MATLAB DTI atlas. Shared parameters must
@@ -180,7 +183,7 @@ def test_merging_fractions_treat_trailing_apostrophe_as_literal_text():
 def test_level_one_structural_parameters_reproduce_the_established_partition():
     """Protect the first-pass model while replacing handwritten grouping."""
     names = _read_names(ATLAS_LUT_VOCABULARIES[0])
-    model = object.__new__(MeshModelPlus)
+    model = MeshModelPlus('', '', [], None)
     model.atlasDir = str(STRUCTURAL_PARAMETER_FILE.parent)
     model.gmmFileName = str(STRUCTURAL_PARAMETER_FILE)
     model.names = names
@@ -236,12 +239,62 @@ def test_level_one_structural_parameters_reproduce_the_established_partition():
         assert structuresByClass[name] == {name}
 
 
+def test_level_two_structural_parameters_encode_the_established_refinement():
+    """Protect the configured 66-label lateral/medial target topology."""
+    names = _read_names(ATLAS_LUT_VOCABULARIES[0])
+    sourceParameters, sourceMemberships = kvlResolveSharedGMMParameters(
+        names, kvlReadSharedGMMParameters(STRUCTURAL_PARAMETER_FILE))
+    targetParameters, targetMemberships = kvlResolveSharedGMMParameters(
+        names, kvlReadSharedGMMParameters(TARGET_STRUCTURAL_PARAMETER_FILE))
+
+    assert sourceMemberships.shape == (14, 66)
+    assert targetMemberships.shape == (15, 66)
+    np.testing.assert_array_equal(
+        np.count_nonzero(targetMemberships, axis=0),
+        np.ones(len(names), dtype=int))
+
+    sourceClassForTargetClass, unchanged = (
+        MeshModelPlus._derive_gmm_topology_correspondence(
+            sourceParameters,
+            sourceMemberships,
+            targetParameters,
+            targetMemberships))
+    assert np.count_nonzero(unchanged) == 13
+    sourceNames = [parameter.mergedName for parameter in sourceParameters]
+    targetNames = [parameter.mergedName for parameter in targetParameters]
+    sourceThalamus = sourceNames.index('Thalamus')
+    lateralThalamus = targetNames.index('LateralThal')
+    medialThalamus = targetNames.index('MedialThal')
+    assert sourceClassForTargetClass[lateralThalamus] == sourceThalamus
+    assert sourceClassForTargetClass[medialThalamus] == sourceThalamus
+    assert not unchanged[lateralThalamus]
+    assert not unchanged[medialThalamus]
+    assert np.count_nonzero(targetMemberships[lateralThalamus]) == 38
+    assert np.count_nonzero(targetMemberships[medialThalamus]) == 12
+    expectedMedial = {
+        f'{side}-{nucleus}'
+        for side in ('Left', 'Right')
+        for nucleus in ('PuA', 'PuI', 'PuL', 'PuM', 'MDl', 'MDm')
+    }
+
+    def members(row):
+        return {names[index] for index in np.flatnonzero(row)}
+
+    assert members(targetMemberships[medialThalamus]) == expectedMedial
+    assert members(targetMemberships[lateralThalamus]) == (
+        members(sourceMemberships[sourceThalamus]) - expectedMedial)
+    np.testing.assert_array_equal(
+        targetMemberships[lateralThalamus]
+        | targetMemberships[medialThalamus],
+        sourceMemberships[sourceThalamus])
+
+
 def test_plus_rejects_structural_models_it_cannot_yet_interpret(
         tmp_path):
     """Cross-row overlap must fail before unsupported Plus activation."""
     parameterFile = tmp_path / 'sharedGMMparameters.txt'
     parameterFile.write_text('First 1 Tissue\nSecond 1 Tissue\n')
-    model = object.__new__(MeshModelPlus)
+    model = MeshModelPlus('', '', [], None)
     model.atlasDir = str(tmp_path)
     model.gmmFileName = str(parameterFile)
     model.names = ['Tissue']
@@ -253,7 +306,7 @@ def test_plus_rejects_structural_models_it_cannot_yet_interpret(
 def test_plus_accepts_disjoint_multicomponent_structural_class(tmp_path):
     parameterFile = tmp_path / 'sharedGMMparameters.txt'
     parameterFile.write_text('Tissue 2 Tissue\n')
-    model = object.__new__(MeshModelPlus)
+    model = MeshModelPlus('', '', [], None)
     model.atlasDir = str(tmp_path)
     model.gmmFileName = str(parameterFile)
     model.names = ['Tissue']
@@ -262,6 +315,81 @@ def test_plus_accepts_disjoint_multicomponent_structural_class(tmp_path):
 
     assert model.sharedGMMParameters[0].numberOfComponents == 2
     np.testing.assert_array_equal(model.classFractions, [[1.0]])
+
+
+@pytest.mark.parametrize(
+    'targetFileName,activationLevelIndex',
+    [('target.txt', None), (None, 1)])
+def test_target_gmm_configuration_requires_file_and_activation_index(
+        tmp_path, targetFileName, activationLevelIndex):
+    sourceFile = tmp_path / 'source.txt'
+    sourceFile.write_text('Tissue 1 Tissue\n')
+    model = MeshModelPlus('', '', [], None)
+    model.atlasDir = str(tmp_path)
+    model.gmmFileName = str(sourceFile)
+    model.targetGMMFileName = targetFileName
+    model.targetGMMActivationLevelIndex = activationLevelIndex
+    model.meshSmoothingSigmas = [1.0, 0.0]
+    model.names = ['Tissue']
+
+    with pytest.raises(ValueError, match='either both be supplied'):
+        model._configure_shared_gmm_parameters()
+
+
+@pytest.mark.parametrize('activationLevelIndex', [True, 0, 2])
+def test_target_gmm_activation_index_must_select_a_later_existing_level(
+        tmp_path, activationLevelIndex):
+    sourceFile = tmp_path / 'source.txt'
+    targetFile = tmp_path / 'target.txt'
+    sourceFile.write_text('Tissue 1 Tissue\n')
+    targetFile.write_text('Tissue 1 Tissue\n')
+    model = MeshModelPlus('', '', [], None)
+    model.atlasDir = str(tmp_path)
+    model.gmmFileName = str(sourceFile)
+    model.targetGMMFileName = str(targetFile)
+    model.targetGMMActivationLevelIndex = activationLevelIndex
+    model.meshSmoothingSigmas = [1.0, 0.0]
+    model.names = ['Tissue']
+
+    with pytest.raises(ValueError, match='targetGMMActivationLevelIndex'):
+        model._configure_shared_gmm_parameters()
+
+
+@pytest.mark.parametrize(
+    'sourceParameters,sourceMemberships,targetParameters,targetMemberships,error',
+    [
+        (
+            [GMMparameter('A', 1, ['A']), GMMparameter('B', 1, ['B'])],
+            [[1, 0], [0, 1]],
+            [GMMparameter('Merged', 1, ['A', 'B'])],
+            [[1, 1]],
+            'merge or cross-cut'),
+        (
+            [GMMparameter('A', 1, ['A'])],
+            [[1]],
+            [GMMparameter('A', 2, ['A'])],
+            [[1]],
+            'may not change'),
+        (
+            [GMMparameter('A', 2, ['A'])],
+            [[1, 1]],
+            [GMMparameter('A1', 1, ['A1']),
+             GMMparameter('A2', 1, ['A2'])],
+            [[1, 0], [0, 1]],
+            'require one source'),
+    ])
+def test_topology_correspondence_rejects_ambiguous_transfers(
+        sourceParameters,
+        sourceMemberships,
+        targetParameters,
+        targetMemberships,
+        error):
+    with pytest.raises((ValueError, NotImplementedError), match=error):
+        MeshModelPlus._derive_gmm_topology_correspondence(
+            sourceParameters,
+            sourceMemberships,
+            targetParameters,
+            targetMemberships)
 
 
 @pytest.mark.parametrize('schema', ['aseg', 'synthseg'])

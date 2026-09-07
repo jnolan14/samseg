@@ -671,7 +671,8 @@ def test_plus_gmm_defaults_full_and_retains_explicit_diagonal_option():
     thalamusModel = ThalamicNucleiPlus(
         atlasDir='atlas', outDir='out', inputImageFileNames=[],
         inputSegFileName='seg')
-    assert not thalamusModel.useTwoComponents
+    assert thalamusModel.targetGMMFileName is None
+    assert thalamusModel.targetGMMActivationLevelIndex is None
 
 
 def test_first_gmm_m_step_uses_rasterized_class_priors_and_uniform_k1_weight():
@@ -825,6 +826,161 @@ def test_low_mass_retention_preserves_components_and_class_weight_simplex():
         [1.0, 1.0])
 
 
+def test_topology_transfer_preserves_all_mapped_gmm_state_without_aliasing():
+    source = GMM(
+        [1, 2], 2, useDiagonalCovarianceMatrices=False,
+        initialMeans=np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+        initialVariances=np.array([
+            [[2.0, 0.1], [0.1, 3.0]],
+            [[4.0, 0.2], [0.2, 5.0]],
+            [[6.0, 0.3], [0.3, 7.0]],
+        ]),
+        initialMixtureWeights=np.array([1.0, 0.3, 0.7]),
+        initialHyperMeans=np.array([
+            [11.0, 12.0], [13.0, 14.0], [15.0, 16.0]]),
+        initialHyperMeansNumberOfMeasurements=np.array([21.0, 22.0, 23.0]),
+        initialHyperVariances=np.array([
+            [[0.0, 0.0], [0.0, 0.0]],
+            [[1.0, 0.1], [0.1, 2.0]],
+            [[3.0, 0.2], [0.2, 4.0]],
+        ]),
+        initialHyperVariancesNumberOfMeasurements=np.array([4.0, 5.0, 6.0]),
+        initialHyperMixtureWeights=np.array([1.0, 0.4, 0.6]),
+        initialHyperMixtureWeightsNumberOfMeasurements=np.array([7.0, 8.0]))
+    source.hyperMeansNumberOfMeasurements = np.array([31.0, 32.0, 33.0])
+    source.hyperVariancesNumberOfMeasurements = np.array([9.0, 10.0, 11.0])
+    source.hyperMixtureWeightsNumberOfMeasurements = np.array([12.0, 13.0])
+    targetParameters = [
+        GMMparameter('UnchangedMixture', 2, ['B']),
+        GMMparameter('FirstChild', 1, ['A1']),
+        GMMparameter('SecondChild', 1, ['A2']),
+    ]
+    sourceClassForTargetClass = np.array([1, 0, 0])
+    gaussianMap = np.array([1, 2, 0, 0])
+
+    target = MeshModelPlus._build_transferred_gmm(
+        source, targetParameters, sourceClassForTargetClass)
+
+    assert target.numberOfGaussiansPerClass == [2, 1, 1]
+    for fieldName in (
+            'means',
+            'variances',
+            'mixtureWeights',
+            'hyperMeans',
+            'hyperVariances',
+            'hyperMixtureWeights',
+            'fullHyperMeansNumberOfMeasurements',
+            'hyperMeansNumberOfMeasurements',
+            'fullHyperVariancesNumberOfMeasurements',
+            'hyperVariancesNumberOfMeasurements'):
+        np.testing.assert_array_equal(
+            getattr(target, fieldName),
+            getattr(source, fieldName)[gaussianMap])
+    for fieldName in (
+            'fullHyperMixtureWeightsNumberOfMeasurements',
+            'hyperMixtureWeightsNumberOfMeasurements'):
+        np.testing.assert_array_equal(
+            getattr(target, fieldName),
+            getattr(source, fieldName)[sourceClassForTargetClass])
+
+    sourceMeans = source.means.copy()
+    target.means[2, 0] = 1000.0
+    target.hyperVariances[3, 0, 0] = 2000.0
+    np.testing.assert_array_equal(source.means, sourceMeans)
+    assert target.means[3, 0] != target.means[2, 0]
+    assert source.hyperVariances[0, 0, 0] != 2000.0
+
+
+def test_topology_transfer_rejects_tied_source_gmm():
+    source = GMM(
+        [1], 1, useDiagonalCovarianceMatrices=False,
+        initialMeans=np.array([[1.0]]),
+        initialVariances=np.array([[[2.0]]]),
+        initialMixtureWeights=np.array([1.0]))
+    source.tied = True
+
+    with pytest.raises(NotImplementedError, match='tied Gaussians'):
+        MeshModelPlus._build_transferred_gmm(
+            source, [GMMparameter('A', 1, ['A'])], np.array([0]))
+
+
+@pytest.mark.parametrize('configureTarget', [False, True])
+def test_configured_unchanged_topology_keeps_authoritative_gmm(
+        tmp_path, configureTarget):
+    sourceFile = tmp_path / 'source.txt'
+    sourceFile.write_text('Unchanged 1 A\n')
+    model = MeshModelPlus(
+        str(tmp_path), str(tmp_path), [], None,
+        gmmFileName=str(sourceFile),
+        targetGMMFileName=str(sourceFile) if configureTarget else None,
+        targetGMMActivationLevelIndex=1 if configureTarget else None)
+    model.names = ['A']
+    model.meshSmoothingSigmas = [0, 0]
+    sourceGMM = object()
+    model.gmm = sourceGMM
+
+    model._configure_shared_gmm_parameters()
+
+    assert model.gmm is sourceGMM
+    assert model._pendingTargetSharedGMMParameters is None
+
+
+@pytest.mark.parametrize('invalidCandidate', [False, True])
+def test_topology_transition_failure_leaves_source_state_authoritative(
+        invalidCandidate):
+    class RejectingPolicy(SubregionModelPolicy):
+        def modify_transferred_gmm_state(
+                self,
+                gmm,
+                targetSharedGMMParameters,
+                sourceClassForTargetClass):
+            gmm.means[0, 0] = 1000.0
+            if invalidCandidate:
+                gmm.variances[0, 0, 0] = np.nan
+            else:
+                raise RuntimeError('reject transferred state')
+
+    sourceGMM = GMM(
+        [1], 1, useDiagonalCovarianceMatrices=False,
+        initialMeans=np.array([[2.0]]),
+        initialVariances=np.array([[[3.0]]]),
+        initialMixtureWeights=np.array([1.0]),
+        initialHyperMeans=np.array([[4.0]]),
+        initialHyperMeansNumberOfMeasurements=np.array([5.0]),
+        initialHyperVariances=np.zeros((1, 1, 1)),
+        initialHyperVariancesNumberOfMeasurements=np.array([3.0]),
+        initialHyperMixtureWeights=np.array([1.0]),
+        initialHyperMixtureWeightsNumberOfMeasurements=np.array([0.0]))
+    model = object.__new__(MeshModelPlus)
+    model.gmm = sourceGMM
+    model.sharedGMMParameters = [GMMparameter('Parent', 1, ['A', 'B'])]
+    model.classFractions = np.array([[1.0, 1.0]])
+    model.sameGaussianParameters = [[10, 20]]
+    model.reducedAlphas = np.array([[1.0]])
+    model._pendingTargetSharedGMMParameters = [
+        GMMparameter('FirstChild', 1, ['A']),
+        GMMparameter('SecondChild', 1, ['B']),
+    ]
+    model._pendingTargetClassFractions = np.eye(2)
+    model._pendingSourceClassForTargetClass = np.array([0, 0])
+    model.modelPolicy = RejectingPolicy()
+
+    error = ('not finite and usable' if invalidCandidate
+             else 'reject transferred state')
+    with pytest.raises(RuntimeError, match=error):
+        model._activate_gmm_topology_transition()
+
+    assert model.gmm is sourceGMM
+    np.testing.assert_array_equal(sourceGMM.means, [[2.0]])
+    assert [parameter.mergedName
+            for parameter in model.sharedGMMParameters] == ['Parent']
+    np.testing.assert_array_equal(model.classFractions, [[1.0, 1.0]])
+    np.testing.assert_array_equal(model.reducedAlphas, [[1.0]])
+    assert model._pendingTargetSharedGMMParameters is not None
+    np.testing.assert_array_equal(model._pendingTargetClassFractions, np.eye(2))
+    np.testing.assert_array_equal(model._pendingSourceClassForTargetClass, [0, 0])
+
+
 def test_fixed_topology_fit_hands_authoritative_multicomponent_gmm_to_gems(
         monkeypatch):
     captured = {}
@@ -852,7 +1008,7 @@ def test_fixed_topology_fit_hands_authoritative_multicomponent_gmm_to_gems(
         def step_optimizer_samseg(self):
             return 1.0, 0.0
 
-    model = object.__new__(MeshModelPlus)
+    model = MeshModelPlus('', '', [], None)
     model.workingImage = _volume(
         np.array([[[1.0]], [[1.5]], [[2.5]], [[3.0]]], dtype='float32'))
     model.workingImageShape = model.workingImage.shape
@@ -860,11 +1016,10 @@ def test_fixed_topology_fit_hands_authoritative_multicomponent_gmm_to_gems(
     model.mesh = Mesh()
     model.meshCollection = MeshCollection()
     model.reducedAlphas = np.ones((1, 1), dtype='float32')
-    model.meshSmoothingSigmas = [0]
-    model.imageSmoothingSigmas = [0]
-    model.maxIterations = [1]
+    model.meshSmoothingSigmas = [0, 0]
+    model.imageSmoothingSigmas = [0, 0]
+    model.maxIterations = [1, 1]
     model.isLong = False
-    model.useTwoComponents = False
     model.optimizerType = 'L-BFGS'
     model.transform = object()
     model.gmm = GMM(
@@ -879,6 +1034,7 @@ def test_fixed_topology_fit_hands_authoritative_multicomponent_gmm_to_gems(
         initialHyperMixtureWeights=np.array([0.5, 0.5]),
         initialHyperMixtureWeightsNumberOfMeasurements=np.array([0.0]))
     model.modelPolicy = SubregionModelPolicy(maximumGMMIterations=2)
+    sourceGMM = model.gmm
     fitGMMParameters = model.gmm.fitGMMParameters
 
     def count_gmm_update(data, gaussianPosteriors):
@@ -899,7 +1055,115 @@ def test_fixed_topology_fit_hands_authoritative_multicomponent_gmm_to_gems(
     assert captured['mixtureWeights'] is model.gmm.mixtureWeights
     np.testing.assert_array_equal(
         captured['numberOfGaussiansPerClass'], [2])
-    assert gmmUpdateCount == 2
+    assert model.gmm is sourceGMM
+    assert gmmUpdateCount == 4
+
+
+def test_topology_transition_first_update_uses_target_spatial_priors(
+        monkeypatch):
+    firstTargetUpdate = {}
+
+    class Mesh:
+        def __init__(self):
+            self.alphas = None
+
+        def rasterize(self, shape, classNumber):
+            if self.alphas.shape[1] == 2:
+                weights = [[65535, 65535, 0, 0], [0, 0, 65535, 65535]]
+                return np.asarray(
+                    weights[classNumber], dtype='uint16').reshape(shape)
+            return np.full(shape, 65535, dtype='uint16')
+
+    class MeshCollection:
+        def smooth(self, sigma):
+            raise AssertionError('zero smoothing should not call smooth')
+
+    class Calculator:
+        def __init__(self, **kwargs):
+            pass
+
+    class Optimizer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def step_optimizer_samseg(self):
+            return 1.0, 0.0
+
+    class RecordingPolicy(SubregionModelPolicy):
+        def update_gmm_parameters(self, gmm, data, gaussianPosteriors):
+            super().update_gmm_parameters(gmm, data, gaussianPosteriors)
+            if gmm.numberOfClasses == 2 and not firstTargetUpdate:
+                firstTargetUpdate['means'] = gmm.means.copy()
+                firstTargetUpdate['variances'] = gmm.variances.copy()
+
+    model = MeshModelPlus('', '', [], None)
+    model.workingImage = _volume(
+        np.array([[[1.0]], [[3.0]], [[7.0]], [[9.0]]], dtype='float32'))
+    model.workingImageShape = model.workingImage.shape
+    model.maskIndices = np.where(np.ones(model.workingImageShape, dtype=bool))
+    model.mesh = Mesh()
+    model.meshCollection = MeshCollection()
+    model.originalAlphas = np.array([[0.4, 0.6]], dtype='float32')
+    model.reducedAlphas = np.ones((1, 1), dtype='float32')
+    model.FreeSurferLabels = np.array([10, 20])
+    model.sharedGMMParameters = [
+        GMMparameter('Parent', 1, ['First', 'Second'])]
+    model.classFractions = np.array([[1.0, 1.0]])
+    model.sameGaussianParameters = [[10, 20]]
+    model._pendingTargetSharedGMMParameters = [
+        GMMparameter('FirstChild', 1, ['First']),
+        GMMparameter('SecondChild', 1, ['Second']),
+    ]
+    model._pendingTargetClassFractions = np.eye(2)
+    model._pendingSourceClassForTargetClass = np.array([0, 0])
+    model.targetGMMFileName = 'configured-target'
+    model.targetGMMActivationLevelIndex = 1
+    model._initializationGaussianMeans = np.array([[5.0]])
+    model._initializationGaussianVariances = np.array([[[1.0]]])
+    model.meshSmoothingSigmas = [0, 0]
+    model.imageSmoothingSigmas = [0, 0]
+    model.maxIterations = [1, 1]
+    model.isLong = False
+    model.optimizerType = 'L-BFGS'
+    model.transform = object()
+    model.gmm = GMM(
+        [1], 1, useDiagonalCovarianceMatrices=False,
+        initialMeans=np.array([[5.0]]),
+        initialVariances=np.array([[[4.0]]]),
+        initialMixtureWeights=np.array([1.0]),
+        initialHyperMeans=np.array([[5.0]]),
+        initialHyperMeansNumberOfMeasurements=np.array([5.0]),
+        initialHyperVariances=np.zeros((1, 1, 1)),
+        initialHyperVariancesNumberOfMeasurements=np.array([3.0]),
+        initialHyperMixtureWeights=np.array([1.0]),
+        initialHyperMixtureWeightsNumberOfMeasurements=np.array([0.0]))
+    sourceGMM = model.gmm
+    model.modelPolicy = RecordingPolicy(maximumGMMIterations=2)
+
+    monkeypatch.setattr(core_plus.gems, 'KvlImage', lambda data: data)
+    monkeypatch.setattr(
+        core_plus.gems, 'KvlCostAndGradientCalculator', Calculator)
+    monkeypatch.setattr(core_plus.gems, 'KvlOptimizer', Optimizer)
+
+    model.fit_mesh_to_image()
+
+    # With two observations per child, kappa=5 and h=3, the first
+    # maintained update must reflect each child's distinct spatial support.
+    np.testing.assert_allclose(firstTargetUpdate['means'], [[29 / 7], [41 / 7]])
+    np.testing.assert_allclose(
+        firstTargetUpdate['variances'], [[[104 / 35]], [[104 / 35]]])
+    assert model.gmm is not sourceGMM
+    assert model.gmm.numberOfGaussiansPerClass == [1, 1]
+    np.testing.assert_array_equal(model.classFractions, np.eye(2))
+    np.testing.assert_allclose(model.reducedAlphas, [[0.4, 0.6]])
+    assert model._initializationGaussianMeans is None
+    assert model._initializationGaussianVariances is None
+    fittedTarget = model.gmm
+    model.meshSmoothingSigmas = [0]
+    model.imageSmoothingSigmas = [0]
+    model.maxIterations = [1]
+    model.fit_mesh_to_image()
+    assert model.gmm is fittedTarget
 
 
 def test_extraction_uses_authoritative_gmm_and_class_fractions(monkeypatch):
@@ -1002,22 +1266,3 @@ def test_regional_em_mask_accepts_finite_negative_and_rejects_missing_channels(
     assert not model.workingMask.data[1, 0, 0]
     assert not model.workingMask.data[2, 0, 0]
     assert model.workingImage.data[0, 0, 0, 1] == -2
-
-
-def test_coarse_to_refined_transition_fails_without_changing_initial_hyperparameters():
-    """The deferred transition must fail before altering first-stage values."""
-    model = object.__new__(ThalamicNucleiPlus)
-    # Nonuniform channel means and strengths make any partial mutation visible.
-    means = np.array([[20.0, 200.0], [80.0, 800.0]])
-    strengths = np.array([10.0, 12.0])
-    originalMeans = means.copy()
-    originalStrengths = strengths.copy()
-
-    with pytest.raises(NotImplementedError, match='configured source and target'):
-        model.get_second_label_groups()
-    with pytest.raises(NotImplementedError, match='configured source and target'):
-        model.get_second_gaussian_hyps(
-            [[], [], []], means, strengths)
-
-    np.testing.assert_array_equal(means, originalMeans)
-    np.testing.assert_array_equal(strengths, originalStrengths)
