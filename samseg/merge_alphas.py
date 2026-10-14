@@ -25,6 +25,7 @@ def _matches_resolved_shared_parameter(name, searchString):
 
 def _match_shared_gmm_parameters(names, mergeOptions, matchesSearchString):
     """Return Boolean row-to-structure matches using one named contract."""
+    ##%% What the heck is the 'one named contract', what's that mean?
     memberships = np.zeros((len(mergeOptions), len(names)), dtype=bool)
     for classNumber, mergeOption in enumerate(mergeOptions):
         for searchString in mergeOption.searchStrings:
@@ -51,6 +52,7 @@ def kvlResolveSharedGMMParameters(names, sharedGMMParameters):
     the returned Boolean membership matrix for the consuming model to
     interpret or reject.
     """
+    ##%% This last paragraph in particular is exceptionally jargon heavy and difficult to understand
     memberships = _match_shared_gmm_parameters(
         names,
         sharedGMMParameters,

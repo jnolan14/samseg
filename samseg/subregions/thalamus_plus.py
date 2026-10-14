@@ -93,6 +93,7 @@ class ThalamicNucleiPlus(MeshModelPlus):
         the masked ``processedImage`` is a separate regional EM representation
         at ``self.resolution``.
         """
+        ##%% A lot of jargon, but it makes sense. Additionally, based on the doc string, I would expect this to operate on/build and refine the correctedImages attribute in the parent class, but this doesn't operate on that, it adds another new class attribute: self.processedImage. This violates the "don't add attributes outside of the __init__" principal, and seems to have a whole second copy of images that aren't needed. Probably the best fix is to settle on the name/attribute that will hold the processed images (correctedImages or processedImages), and initialize that as an empty list in the __init__, then populate in initialize an refine it here, or just populate it here.
 
         # Output/postprocessing uses the canonical thalamus segmentation labels.
         self.THlabelLeft = 10

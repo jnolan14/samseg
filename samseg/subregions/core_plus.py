@@ -37,6 +37,7 @@ class MeshModelPlus:
     regional intensity fitting, and output. Configured intensity-stage
     transitions remain explicit fail-closed extension seams.
     """
+    ##%% This is pretty clear, but a bit jargon heavy. Would be good to use terms more in line with samseg nomenclature
 
     # -------------------------------------------------------------------------
     # Shared lifecycle state
@@ -75,6 +76,7 @@ class MeshModelPlus:
             preliminarySharedGMMParametersFileName)
         self.gmmFileName = gmmFileName
         self.targetGMMFileName = targetGMMFileName
+        ##%% What is the point of this field?
         self.targetGMMActivationLevelIndex = (
             targetGMMActivationLevelIndex)
         self.useDiagonalCovarianceMatrices = useDiagonalCovarianceMatrices
@@ -219,7 +221,9 @@ class MeshModelPlus:
         # lifecycle representation is derived independently from these sources.
         self.inputSeg = sf.load_volume(self.inputSegFileName)
         self.inputImages = [sf.load_volume(path) for path in self.inputImageFileNames]
+        ##%% These self.correctedImages volumes are just copies here, and I don't see anywhere in the *_plus implementations where this is actually operated on (maybe I missed it). Do we need this at all? Seems like it would be intended to hold the resampled/cropped images, but just copies. Additionally, this breaks the design choice to "not add class attributes not defined in the __init__", this field is not a model attribute until this initialize method is called.
         self.correctedImages = [img.copy() for img in self.inputImages]
+        ##%% This is not necessairly a problem, but it forces the convention that the first image in the list of intensity images should be used as the reference for the priors. Not sure if this should be the case, say we have a T1 and T2, is there a preferred contrast? But not sure how we would tell them apart, or if this would even really matter if we're just using this to initialize the matrix and will update values later in the EM fitting.
         self.intensityPriorReferenceImage = self.inputImages[0]
         self.highResImage = np.mean(self.inputImages[0].geom.voxsize) < 0.99
 
@@ -265,7 +269,7 @@ class MeshModelPlus:
          self.sharedGMMParameters,
          self.classFractions) = self._resolve_shared_gmm_parameters(
             self.gmmFileName, 'source')
-
+        ##%% Not entirely sure what the activationLevelIndex is, but I think this logic is flawed. In the first if statement below, it states that this can be omitted, but that will break below (see note)
         targetFileName = self.targetGMMFileName
         activationLevelIndex = self.targetGMMActivationLevelIndex
         if (targetFileName is None) != (activationLevelIndex is None):
@@ -278,7 +282,7 @@ class MeshModelPlus:
         self._pendingSourceClassForTargetClass = None
         if targetFileName is None:
             return
-
+        ##%% This is the block referenced above, where if the targetGMMActivationLevelIndex is the default value (None), which is suggested to be valid based on the constructor signature and the error message below the previous comment in this function, however, if it is initialized to be (None), this will evaluate to True and throw a ValueError in the case it is omitted.
         if (isinstance(activationLevelIndex, (bool, np.bool_))
                 or not isinstance(activationLevelIndex, (int, np.integer))):
             raise ValueError(
@@ -319,6 +323,7 @@ class MeshModelPlus:
             targetParameters,
             targetMemberships):
         """Map resolved disjoint partitions of the same LUT to source owners."""
+        ##%% This doc string is a lot of jargon. Not entirely sure what this function is doing, but I think it's trying to figure out how to build a correspondence beteen the name/idx of ROI's in LUT associated with the initial segmentation volume, and the fields/groupings for handling them in the EM loop based on the sharred parameters files, but I don't quite understand it.
         sourceMemberships = np.asarray(sourceMemberships, dtype=bool)
         targetMemberships = np.asarray(targetMemberships, dtype=bool)
 
@@ -398,6 +403,7 @@ class MeshModelPlus:
         the authoritative stage sources directly to avoid chained
         interpolation.
         """
+        ##%% This doc string is probably the clearest and most digestable. This seems like it should be called in the list comprehension that creates the correctedImages list, but it isn't. (But I could be entirely misunderstanding the intent behind this method and that attribute).
         if not sourceFileNames:
             raise ValueError('At least one intensity image is required')
         if referenceImage.data.ndim != 3:
@@ -463,6 +469,7 @@ class MeshModelPlus:
 
     def _localizer_anatomical_support(self, referenceImage):
         """Return policy-expanded non-background localizer support on a grid."""
+        ##%% What is meant by 'localizer' here?
         if self.preliminaryClassFractions is None:
             raise RuntimeError(
                 'Preliminary class ownership is required for localizer '
@@ -498,6 +505,7 @@ class MeshModelPlus:
 
     def _apply_atlas_domain_interior_margin(self, support, image, marginInMm):
         """Apply a physical inward margin to atlas cuboid support."""
+        ##%% So many words to say we're eroding an image
         if marginInMm <= 0:
             return support
         return scipy.ndimage.binary_erosion(
@@ -507,6 +515,7 @@ class MeshModelPlus:
 
     def _apply_affine_target_morphology(self, support):
         """Apply the policy-selected one-voxel affine-target morphology."""
+        ##%% Can we get more hyphenated jargon in this?
         structure = utils.spherical_strel(1)
         return self._ensure_model_policy().apply_affine_target_morphology(
             support, structure)
@@ -526,7 +535,7 @@ class MeshModelPlus:
 
     def reduce_alphas(self, sameGaussianParameters, alphas=None):
         """
-        Compute a set of reduced alpha values given groups of labels. Will use the original
+        Compute a set of reduced alpha values given groups of labels. Will ulocalise the original
         alpha values if alphas is None.
         """
         if alphas is None:

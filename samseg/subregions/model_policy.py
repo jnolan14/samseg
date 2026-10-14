@@ -9,7 +9,7 @@ import scipy.ndimage
 # -----------------------------------------------------------------------------
 # Policy decisions
 # -----------------------------------------------------------------------------
-
+##%% This very much reads like agentic code, not necessairly a bad thing, but it is a bit overly verbose in places an can be tough to read. However, if I understand the implementation ideology, it makes sense. Here, we have a bunch of methods for manipulating the means/hyperparameters for all the special cases, implemented as the _* functions in the file. Dictonaries are then defined which correspond to the 'special cases', where the values are references to the 'hacks' functions. These dictionaries are handed to the model policy class object which handles applying the 'hacks' at the proper time. By defining the hacky functionality here in the functions, we give users the ability to define additional special cases for handling the means/hyps, without exposing something like a raw exec() call. Custom re-use of these functions can be specified via a json.
 @dataclass(frozen=True)
 class MeanHyperparameterFallbackConfiguration:
     """Configure fallback mean hyperparameters for an unsupported class."""
@@ -22,6 +22,7 @@ class MeanHyperparameterFallbackConfiguration:
 def _subject_non_background_median_mean_hyperparameter_fallback(
         configuration, aggregateObservations, numberOfChannels):
     """Return subject-median mean hyperparameters for one unsupported class."""
+    ##%% median mean?
     observations = np.asarray(aggregateObservations)
     if (observations.ndim != 2
             or observations.shape[1] != numberOfChannels):
@@ -266,6 +267,7 @@ class SubregionModelPolicy:
         while allowing later configured comparison behavior to alter only the
         unpublished target GMM.
         """
+        ##%% this seems incomplete
         return None
 
     def has_gmm_converged(
